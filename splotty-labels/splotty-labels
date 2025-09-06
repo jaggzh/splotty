@@ -140,8 +140,8 @@ class LabelManagerApp(App):
 
         with Horizontal(id="main-split"):
             with Vertical(id="tree-col"):
-                self.tree = GroupTree("Root", id="tree")
-                yield self.tree
+                self.group_tree = GroupTree("Root", id="tree")
+                yield self.group_tree
             with Vertical(id="fields-col"):
                 self.fields = FieldsList(id="fields")
                 yield self.fields
@@ -195,10 +195,10 @@ class LabelManagerApp(App):
     # ---------- Populate widgets ----------
 
     def populate_tree(self) -> None:
-        self.tree.root.label = self.preset.tree_nodes[self.preset.root_id].name
-        self.tree.root.allow_expand = True
-        self.tree.root.expand()
-        self.tree.clear()
+        self.group_tree.root.label = self.preset.tree_nodes[self.preset.root_id].name
+        self.group_tree.root.allow_expand = True
+        self.group_tree.root.expand()
+        self.group_tree.clear()
         # rebuild textual tree from model
         def add_children(parent_txt_node: TextualTreeNode, parent_id: str):
             parent_model = self.preset.tree_nodes[parent_id]
@@ -210,9 +210,9 @@ class LabelManagerApp(App):
                 tnode.data = child_id
                 if m.type == "branch":
                     add_children(tnode, child_id)
-        add_children(self.tree.root, self.preset.root_id)
-        self.tree.show_root = True
-        self.tree.select_node(self.tree.root)
+        add_children(self.group_tree.root, self.preset.root_id)
+        self.group_tree.show_root = True
+        self.group_tree.select_node(self.group_tree.root)
 
     def populate_fields(self) -> None:
         self.fields.clear()
@@ -231,7 +231,7 @@ class LabelManagerApp(App):
         field_id = msg.field_id
         if not field_id:
             return
-        tnode = self.tree.cursor_node or self.tree.root
+        tnode = self.group_tree.cursor_node or self.group_tree.root
         model_target_id = tnode.data if tnode.data else self.preset.root_id
         self.insert_field_under(model_target_id, field_id)
         self.populate_tree()
@@ -259,7 +259,7 @@ class LabelManagerApp(App):
 
     # Tree actions (subset; wire rest as needed)
     def current_model_node(self) -> tuple[TextualTreeNode, ModelNode]:
-        tnode = self.tree.cursor_node or self.tree.root
+        tnode = self.group_tree.cursor_node or self.group_tree.root
         mid = tnode.data if tnode.data else self.preset.root_id
         return tnode, self.preset.tree_nodes[mid]
 
@@ -297,17 +297,70 @@ class LabelManagerApp(App):
         self._pending_delete = mnode.id
 
     def action_tree_expand_one(self) -> None:
-        self.tree.expand_node()
+        # Expand the currently focused node (or root if none)
+        node = self.group_tree.cursor_node or self.group_tree.root
+        if node is not None:
+            node.expand()
+
     def action_tree_expand_all(self) -> None:
-        self.tree.expand_all()
+        # Recursively expand the entire tree starting at root
+        def rec(n):
+            n.expand()
+            for c in n.children:
+                rec(c)
+        rec(self.group_tree.root)
+
     def action_tree_collapse_one(self) -> None:
-        self.tree.collapse_node()
+        # Collapse the currently focused node (or root if none)
+        node = self.group_tree.cursor_node or self.group_tree.root
+        if node is not None:
+            node.collapse()
+
     def action_tree_collapse_all(self) -> None:
-        self.tree.collapse_all()
+        # Recursively collapse the entire tree starting at root
+        def rec(n):
+            n.collapse()
+            for c in n.children:
+                rec(c)
+        rec(self.group_tree.root)
+
+    # --- Tree navigation helpers (replace cursor_down/cursor_up calls) ---
+    def _visible_nodes(self):
+        nodes = []
+        def walk(n):
+            nodes.append(n)
+            if getattr(n, "expanded", False):
+                for c in n.children:
+                    walk(c)
+        walk(self.group_tree.root)
+        return nodes
+
+    def _select_node(self, node):
+        try:
+            self.group_tree.select_node(node)
+        except Exception:
+            # Some Textual versions use action_select_node
+            self.group_tree.action_select_node(node)
+
     def action_tree_down(self) -> None:
-        self.tree.cursor_down()
+        current = self.group_tree.cursor_node or self.group_tree.root
+        flat = self._visible_nodes()
+        try:
+            i = flat.index(current)
+        except ValueError:
+            i = 0
+        if i < len(flat) - 1:
+            self._select_node(flat[i + 1])
+
     def action_tree_up(self) -> None:
-        self.tree.cursor_up()
+        current = self.group_tree.cursor_node or self.group_tree.root
+        flat = self._visible_nodes()
+        try:
+            i = flat.index(current)
+        except ValueError:
+            i = 0
+        if i > 0:
+            self._select_node(flat[i - 1])
 
     def action_tree_edit_or_insert(self) -> None:
         # For brevity, toggle rename on branches; inserting from fields is via Enter in Fields or drop
@@ -398,7 +451,7 @@ class LabelManagerApp(App):
     # ---------- Contextual help ----------
 
     def update_context_help(self) -> None:
-        if self.focused is self.tree:
+        if self.focused is self.group_tree:
             self.update_help_for_tree()
         elif self.focused is self.fields:
             self.helpbar.update("(h/j) up/down   (Enter) Add to tree   (Drag) drop onto Tree")

@@ -1,2 +1,4 @@
 textual>=0.50
 rich>=13.7
+pyserial>=3.5
+pyserial-asyncio>=0.6
