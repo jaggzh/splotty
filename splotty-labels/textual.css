@@ -1,0 +1,56 @@
+/* Layout + sizing rules matching "expandable but minimal" panes */
+Screen {
+  layout: vertical;
+}
+
+#header {
+  height: 1;
+}
+
+#main-split {
+  layout: horizontal;
+  height: 1fr;
+}
+
+#tree-col {
+  width: 40;
+  min-width: 30;
+}
+
+#fields-col {
+  width: 1fr;
+}
+
+#serial-preview {
+  height: auto;
+  max-height: 8;
+  overflow: auto;
+  border: tall $accent-darken-2;
+}
+
+#dynamic-pane {
+  height: auto;
+  max-height: 3;
+  overflow: auto;
+  border: tall $accent-darken-2;
+}
+
+#help-line {
+  height: auto;
+  max-height: 2;
+  overflow: auto;
+  color: $text-muted;
+}
+
+.tree-leaf {
+  color: $accent;
+}
+
+.tree-highlight {
+  text-style: bold;
+}
+
+.tree-highlight-focus {
+  text-style: bold italic;
+  color: $warning;
+}

@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import asyncio
+import uuid
+from pathlib import Path
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Static, Tree, ListView, ListItem, Label, Footer
+from textual.widgets._tree import TreeNode as TextualTreeNode
+from textual import events
+from textual.reactive import reactive
+from textual.message import Message
+
+from models import Preset, TreeNode as ModelNode, FieldDef
+from storage import Storage
+
+# ---------- Helpers ----------
+
+def new_id(prefix: str = "n") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+# ---------- Widgets ----------
+
+class HeaderBar(Static):
+    preset_name: reactive[str] = reactive("")
+    device: reactive[str] = reactive("")
+    baud: reactive[int] = reactive(115200)
+    parity: reactive[str] = reactive("N")
+    stopbits: reactive[int] = reactive(1)
+
+    def render(self):
+        return (
+            f"{self.preset_name}    (Alt+s)Save   (q)quit   (Alt+d){self.device} "
+            f"{self.baud} {self.parity}{self.stopbits}"
+        )
+
+class SerialPreview(Static):
+    def set_preview(self, label_line: str, data_line: str) -> None:
+        self.update(f"{label_line}\n{data_line}")
+
+class DynamicPane(Static):
+    interactive: reactive[bool] = reactive(False)
+
+class HelpBar(Static):
+    pass
+
+class FieldsList(ListView):
+    class StartDrag(Message):
+        def __init__(self, field_id: str, field_label: str) -> None:
+            self.field_id = field_id
+            self.field_label = field_label
+            super().__init__()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # select the clicked item and initiate a drag intent
+        if isinstance(event.sender, FieldsList):
+            # Textual selects by keyboard; we need to ensure selection follows click
+            if self.index is not None:
+                item = self.children[self.index]
+            # Find item by y coordinate approx: let Textual handle selection via click first
+        # Let the click run default first so selection is updated
+        self.post_message(self.StartDrag(self.selected_field_id, self.selected_field_label))
+
+    @property
+    def selected_field_id(self) -> str:
+        item = self.get_selected_item()
+        return getattr(item, "field_id", "") if item else ""
+
+    @property
+    def selected_field_label(self) -> str:
+        item = self.get_selected_item()
+        return getattr(item, "field_label", "") if item else ""
+
+    def get_selected_item(self) -> ListItem | None:
+        if self.index is None:
+            return None
+        try:
+            return self.children[self.index]
+        except Exception:
+            return None
+
+class FieldItem(ListItem):
+    def __init__(self, field: FieldDef):
+        super().__init__(Label(field.label))
+        self.field_id = field.id
+        self.field_label = field.label
+
+class GroupTree(Tree):
+    class DropField(Message):
+        def __init__(self, field_id: str) -> None:
+            self.field_id = field_id
+            super().__init__()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        app = self.app
+        dragging = getattr(app, "dragging_field", None)
+        if dragging:
+            # Drop occurred on tree; insert relative to current selection
+            self.post_message(self.DropField(dragging))
+            app.dragging_field = None
+
+# ---------- App ----------
+
+class LabelManagerApp(App):
+    CSS_PATH = "textual.css"
+    BINDINGS = [
+        ("tab", "cycle_focus", "Cycle focus"),
+        ("q", "quit_confirm", "Quit"),
+        ("alt+d", "device_select", "Device"),
+        ("alt+s", "save_preset", "Save"),
+        ("m", "monitor", "Monitor"),
+        # Tree keys
+        ("h", "tree_collapse_one", None),
+        ("H", "tree_collapse_all", None),
+        ("l", "tree_expand_one", None),
+        ("L", "tree_expand_all", None),
+        ("j", "tree_down", None),
+        ("k", "tree_up", None),
+        ("J", "tree_move_down", None),
+        ("K", "tree_move_up", None),
+        ("-", "tree_delete", None),
+        ("a", "tree_add_child", None),
+        ("o", "tree_add_sibling", None),
+        ("enter", "tree_edit_or_insert", None),
+    ]
+
+    dragging_field: str | None = None  # global drag payload (field id)
+
+    def __init__(self, preset_name: str, storage_dir: Path) -> None:
+        super().__init__()
+        self.storage = Storage(storage_dir)
+        self.preset = self.storage.load(preset_name)
+
+    # ---------- Compose ----------
+
+    def compose(self) -> ComposeResult:
+        self.header = HeaderBar(id="header")
+        yield self.header
+
+        with Horizontal(id="main-split"):
+            with Vertical(id="tree-col"):
+                self.tree = GroupTree("Root", id="tree")
+                yield self.tree
+            with Vertical(id="fields-col"):
+                self.fields = FieldsList(id="fields")
+                yield self.fields
+
+        self.preview = SerialPreview(id="serial-preview")
+        yield self.preview
+
+        self.dynamic = DynamicPane(id="dynamic-pane")
+        yield self.dynamic
+
+        self.helpbar = HelpBar(id="help-line")
+        yield self.helpbar
+
+        yield Footer()
+
+    # ---------- on_mount ----------
+
+    def on_mount(self) -> None:
+        # header info
+        self.header.preset_name = self.preset.name
+        self.header.device = self.preset.device
+        self.header.baud = self.preset.baud
+        self.header.parity = self.preset.parity
+        self.header.stopbits = self.preset.stopbits
+
+        # Tree populate
+        self.populate_tree()
+        # Fields populate (demo data if empty)
+        if not self.preset.fields:
+            demo = [
+                FieldDef(id="S1.raw", label="S1.raw"),
+                FieldDef(id="S2.raw", label="S2.raw"),
+                FieldDef(id="S1.xmax", label="S1.xmax"),
+                FieldDef(id="S1.xmax.sm", label="S1.xmax.sm"),
+                FieldDef(id="S1.xmin", label="S1.xmin"),
+                FieldDef(id="S1.xmin.sm", label="S1.xmin.sm"),
+            ]
+            for f in demo:
+                self.preset.fields[f.id] = f
+        self.populate_fields()
+
+        # Preview
+        if self.preset.last_preview:
+            self.preview.set_preview(
+                self.preset.last_preview.get("label_line", ""),
+                self.preset.last_preview.get("data_line", ""),
+            )
+
+        self.update_help_for_tree()
+
+    # ---------- Populate widgets ----------
+
+    def populate_tree(self) -> None:
+        self.tree.root.label = self.preset.tree_nodes[self.preset.root_id].name
+        self.tree.root.allow_expand = True
+        self.tree.root.expand()
+        self.tree.clear()
+        # rebuild textual tree from model
+        def add_children(parent_txt_node: TextualTreeNode, parent_id: str):
+            parent_model = self.preset.tree_nodes[parent_id]
+            for child_id in parent_model.children:
+                m = self.preset.tree_nodes[child_id]
+                label = m.name if m.type == "branch" else f"f {m.name}"
+                tnode = parent_txt_node.add(label, expand=m.expanded)
+                tnode.allow_expand = m.type == "branch"
+                tnode.data = child_id
+                if m.type == "branch":
+                    add_children(tnode, child_id)
+        add_children(self.tree.root, self.preset.root_id)
+        self.tree.show_root = True
+        self.tree.select_node(self.tree.root)
+
+    def populate_fields(self) -> None:
+        self.fields.clear()
+        for f in sorted(self.preset.fields.values(), key=lambda x: x.label.lower()):
+            self.fields.append(FieldItem(f))
+
+    # ---------- Event Handlers ----------
+
+    def on_fields_list_start_drag(self, msg: FieldsList.StartDrag) -> None:
+        if msg.field_id:
+            self.dragging_field = msg.field_id
+            self.dynamic.update(f"Drag: {msg.field_label} → drop on Tree to insert")
+
+    def on_group_tree_drop_field(self, msg: GroupTree.DropField) -> None:
+        # Insert dropped field under current selection in textual tree
+        field_id = msg.field_id
+        if not field_id:
+            return
+        tnode = self.tree.cursor_node or self.tree.root
+        model_target_id = tnode.data if tnode.data else self.preset.root_id
+        self.insert_field_under(model_target_id, field_id)
+        self.populate_tree()
+        self.dynamic.update(f"Inserted field '{field_id}' under '{self.preset.tree_nodes[model_target_id].name}'")
+
+    # ---------- Actions ----------
+
+    def action_cycle_focus(self) -> None:
+        self.focus_next()
+        self.update_context_help()
+
+    def action_quit_confirm(self) -> None:
+        self.dynamic.update("Quit? (y/N)")
+        self.dynamic.interactive = True
+
+    def action_device_select(self) -> None:
+        # Simplified device selector into dynamic pane; you can wire real device list
+        valid = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0", "COM3", "COM4"]
+        current = self.preset.device or valid[0]
+        self.dynamic.update(f"{' '.join(valid)}  [Current: {current}]  (not editable in this stub)")
+
+    def action_save_preset(self) -> None:
+        self.storage.save(self.preset)
+        self.dynamic.update(f"Saved preset '{self.preset.name}'")
+
+    # Tree actions (subset; wire rest as needed)
+    def current_model_node(self) -> tuple[TextualTreeNode, ModelNode]:
+        tnode = self.tree.cursor_node or self.tree.root
+        mid = tnode.data if tnode.data else self.preset.root_id
+        return tnode, self.preset.tree_nodes[mid]
+
+    def action_tree_add_child(self) -> None:
+        tnode, mnode = self.current_model_node()
+        if mnode.type != "branch":
+            return
+        nid = new_id("b")
+        new = ModelNode(id=nid, name=self.unique_child_name(mnode, "New"), type="branch", parent_id=mnode.id)
+        self.preset.tree_nodes[nid] = new
+        mnode.children.append(nid)
+        self.populate_tree()
+
+    def action_tree_add_sibling(self) -> None:
+        tnode, mnode = self.current_model_node()
+        if mnode.parent_id is None:
+            return
+        parent = self.preset.tree_nodes[mnode.parent_id]
+        nid = new_id("b")
+        new = ModelNode(id=nid, name=self.unique_child_name(parent, "New"), type="branch", parent_id=parent.id)
+        self.preset.tree_nodes[nid] = new
+        # insert after current
+        idx = parent.children.index(mnode.id)
+        parent.children.insert(idx + 1, nid)
+        self.populate_tree()
+
+    def action_tree_delete(self) -> None:
+        tnode, mnode = self.current_model_node()
+        if mnode.parent_id is None:
+            self.dynamic.update("Cannot delete Root")
+            return
+        count = self.count_subtree(mnode.id)
+        self.dynamic.update(f"Delete subtree '{mnode.name}' ({count} nodes)? (y/N)")
+        self.dynamic.interactive = True
+        self._pending_delete = mnode.id
+
+    def action_tree_expand_one(self) -> None:
+        self.tree.expand_node()
+    def action_tree_expand_all(self) -> None:
+        self.tree.expand_all()
+    def action_tree_collapse_one(self) -> None:
+        self.tree.collapse_node()
+    def action_tree_collapse_all(self) -> None:
+        self.tree.collapse_all()
+    def action_tree_down(self) -> None:
+        self.tree.cursor_down()
+    def action_tree_up(self) -> None:
+        self.tree.cursor_up()
+
+    def action_tree_edit_or_insert(self) -> None:
+        # For brevity, toggle rename on branches; inserting from fields is via Enter in Fields or drop
+        tnode, mnode = self.current_model_node()
+        if mnode.type == "branch":
+            # simple inline rename via dynamic prompt (stub)
+            self.dynamic.update(f"Rename '{mnode.name}' not implemented in stub")
+        else:
+            self.dynamic.update("Leaf selected")
+
+    # Monitor stub
+    async def action_monitor(self) -> None:
+        secs = self.preset.monitor_secs
+        self.dynamic.update(f"Monitoring ({secs}s...)")
+        await asyncio.sleep(0.1)
+        label = "s1raw: s1ema: s2raw: s2ema:"
+        data = "51 50 32 30"
+        self.preset.last_preview = {"label_line": label, "data_line": data}
+        self.preview.set_preview(label, data)
+        self.dynamic.update("Monitor complete (stub)")
+
+    # ---------- Insertion logic ----------
+
+    def insert_field_under(self, target_model_id: str, field_id: str) -> None:
+        target = self.preset.tree_nodes[target_model_id]
+        # If target is a leaf, insert after it under its parent; if branch, insert as last child
+        if target.type == "field":
+            parent = self.preset.tree_nodes[target.parent_id] if target.parent_id else self.preset.tree_nodes[self.preset.root_id]
+            nid = new_id("f")
+            fnode = ModelNode(id=nid, name=self.preset.fields[field_id].label, type="field", parent_id=parent.id, field_id=field_id)
+            self.preset.tree_nodes[nid] = fnode
+            idx = parent.children.index(target.id)
+            parent.children.insert(idx + 1, nid)
+        else:
+            nid = new_id("f")
+            fnode = ModelNode(id=nid, name=self.preset.fields[field_id].label, type="field", parent_id=target.id, field_id=field_id)
+            self.preset.tree_nodes[nid] = fnode
+            target.children.append(nid)
+
+    # ---------- Utilities ----------
+
+    def unique_child_name(self, parent: ModelNode, base: str) -> str:
+        existing = {self.preset.tree_nodes[c].name for c in parent.children}
+        n = 1
+        name = f"{base}-{n}"
+        while name in existing:
+            n += 1
+            name = f"{base}-{n}"
+        return name
+
+    def count_subtree(self, node_id: str) -> int:
+        def rec(nid: str) -> int:
+            n = self.preset.tree_nodes[nid]
+            return 1 + sum(rec(c) for c in n.children)
+        return rec(node_id)
+
+    # ---------- Global key routing to implement y/N confirms ----------
+
+    def on_key(self, event: events.Key) -> None:
+        if getattr(self.dynamic, "interactive", False):
+            if event.key == "y":
+                # Handle pending operations
+                if hasattr(self, "_pending_delete") and self._pending_delete:
+                    self._delete_subtree(self._pending_delete)
+                    self._pending_delete = None
+                    self.dynamic.update("Deleted.")
+                elif self.dynamic.renderable and "Quit?" in str(self.dynamic.renderable):
+                    self.exit()
+                self.dynamic.interactive = False
+            elif event.key in ("escape", "n"):
+                self.dynamic.update("")
+                self.dynamic.interactive = False
+
+    def _delete_subtree(self, node_id: str) -> None:
+        node = self.preset.tree_nodes[node_id]
+        parent = self.preset.tree_nodes.get(node.parent_id) if node.parent_id else None
+        # recursive delete
+        def rec(nid: str):
+            n = self.preset.tree_nodes[nid]
+            for c in list(n.children):
+                rec(c)
+            self.preset.tree_nodes.pop(nid, None)
+        rec(node_id)
+        if parent:
+            parent.children = [c for c in parent.children if c != node_id]
+        self.populate_tree()
+
+    # ---------- Contextual help ----------
+
+    def update_context_help(self) -> None:
+        if self.focused is self.tree:
+            self.update_help_for_tree()
+        elif self.focused is self.fields:
+            self.helpbar.update("(h/j) up/down   (Enter) Add to tree   (Drag) drop onto Tree")
+        else:
+            self.helpbar.update("")
+
+    def update_help_for_tree(self) -> None:
+        self.helpbar.update("[Tab]  [Add: (a)Child (o)Sibling]  (Enter)Edit  (M)onitor  (h/H)collapse  (l/L)expand  (J/K)move  (Alt-j/k)reparent  (-)delete")
+
+# ---------- CLI ----------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--preset", default="default", help="Preset name")
+    parser.add_argument("-l", "--list-presets", action="store_true")
+    parser.add_argument("--config-dir", default=str(Path.home() / ".splotty-labels"))
+    args = parser.parse_args()
+
+    storage = Storage(Path(args.config_dir))
+    if args.list_presets:
+        for name in storage.list_presets():
+            print(name)
+        return
+
+    app = LabelManagerApp(args.preset, Path(args.config_dir))
+    app.run()
+
+if __name__ == "__main__":
+    main()
