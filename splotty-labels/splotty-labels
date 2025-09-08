@@ -16,6 +16,7 @@ from models import Preset, TreeNode as ModelNode, FieldDef
 from storage import Storage
 
 import re
+import sys
 import serial_asyncio
 from serial.tools import list_ports
 
@@ -35,7 +36,7 @@ class HeaderBar(Static):
 
     def render(self):
         return (
-            f"{self.preset_name}    (Alt+s)Save   (q)quit   (Alt+d){self.device} "
+            f"{self.preset_name}    (Alt+s)Save   (q)quit   (d){self.device} "
             f"{self.baud} {self.parity}{self.stopbits}"
         )
 
@@ -115,7 +116,7 @@ class LabelManagerApp(App):
     BINDINGS = [
         ("tab", "cycle_focus", "Cycle focus"),
         ("q", "quit_confirm", "Quit"),
-        ("alt+d", "device_select", "Device"),
+        ("d", "device_select", "Device"),
         ("alt+s", "save_preset", "Save"),
         ("m", "monitor", "Monitor"),
         # Tree keys
@@ -244,7 +245,7 @@ class LabelManagerApp(App):
         secs = self.preset.monitor_secs
         dev = self.preset.device
         if not dev:
-            self.dynamic.update("No device set. Use Alt+d to choose a device.")
+            self.dynamic.update("No device set. Use 'd' to choose a device.")
             return
         self.dynamic.update(f"Monitoring ({secs}s...)")
         try:
@@ -274,6 +275,7 @@ class LabelManagerApp(App):
     def action_quit_confirm(self) -> None:
         self.dynamic.update("Quit? (y/N)")
         self.dynamic.interactive = True
+        self._pending_quit = True
 
     def action_device_select(self) -> None:
         # Device selection UI in Dynamic pane (interactive)
@@ -286,8 +288,8 @@ class LabelManagerApp(App):
         idx = valid.index(current) if current in valid else 0
         self._mode = "devsel"
         self._devsel = {"valid": valid, "index": idx}
-        self.dynamic.interactive = True
         self._render_device_select()
+        self.dynamic.interactive = True
         self.set_focus(self.dynamic)
 
     def action_save_preset(self) -> None:
@@ -438,10 +440,10 @@ class LabelManagerApp(App):
         return None
 
     def _has_label_tokens(self, line: str) -> bool:
-        return bool(re.search(r"(?:^|\\s)[^\\s:]+\\s*:", line))
+        return bool(re.search(r"(?:^|\s)[^\s:]+\s*:", line))
 
     def _extract_labels(self, line: str) -> list[str]:
-        return [m.group(1) for m in re.finditer(r"(?:^|\\s)([^\\s:]+)\\s*:", line)]
+        return [m.group(1) for m in re.finditer(r"(?:^|\s)([^\s:]+)\s*:", line)]
 
     def action_tree_edit_or_insert(self) -> None:
         # For brevity, toggle rename on branches; inserting from fields is via Enter in Fields or drop
@@ -490,6 +492,7 @@ class LabelManagerApp(App):
     # ---------- Global key routing to implement y/N confirms ----------
 
     def on_key(self, event: events.Key) -> None:
+        self.dynamic.update(f"DEBUG: Key pressed: {event.key!r}")
         if getattr(self.dynamic, "interactive", False):
             # --- Device select mode ---
             if self._mode == "devsel":
@@ -527,6 +530,8 @@ class LabelManagerApp(App):
                     self.dynamic.interactive = False
                     self.action_quit_confirm()
                     return
+                # Consume all other keys in device selection mode to prevent fallthrough
+                return
             # --- Generic confirm mode (y/N) ---
             if event.key == "y":
                 if hasattr(self, "_pending_delete") and self._pending_delete:
@@ -535,11 +540,18 @@ class LabelManagerApp(App):
                     self.dynamic.update("Deleted.")
                 elif self.dynamic.renderable and "Quit?" in str(self.dynamic.renderable):
                     self.exit()
+                else:
+                    # Add a fallback quit check
+                    if hasattr(self, "_pending_quit") and self._pending_quit:
+                        self.exit()
                 self.dynamic.interactive = False
                 return
-            if event.key in ("escape", "n"):
+
+            if event.key in ("n"):
                 self.dynamic.update("")
                 self.dynamic.interactive = False
+                if hasattr(self, "_pending_quit"):
+                    self._pending_quit = False
                 return
 
 
@@ -565,9 +577,9 @@ class LabelManagerApp(App):
         if not valid:
             self.dynamic.update("No serial devices found. (Esc) to cancel")
             return
-        line = " ".join(f"[{v}]" if i == idx else v for i, v in enumerate(valid))
+        line = " ".join(f"\\[{v}]" if i == idx else v for i, v in enumerate(valid))
         current = valid[idx]
-        self.dynamic.update(f"{line}   [Current: {current}]  (Up/Down, Enter to set, Esc to cancel)")
+        self.dynamic.update(f"{line}   \\[Current: {current}]  (Up/Down, Enter to set, Esc to cancel)")
 
     # ---------- Contextual help ----------
 
