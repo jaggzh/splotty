@@ -403,10 +403,19 @@ class LabelManagerApp(App):
 
     async def _capture_and_parse(self, device: str, baud: int, seconds: int) -> tuple[str | None, str | None]:
         reader, _ = await serial_asyncio.open_serial_connection(url=device, baudrate=baud)
-        lines: list[str] = []
         loop = asyncio.get_running_loop()
         end = loop.time() + seconds
+        
+        best_label_line = None
+        best_data_line = None
+        
         try:
+            # Discard any partial line that might be in the buffer
+            try:
+                await asyncio.wait_for(reader.readline(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+                
             while loop.time() < end:
                 try:
                     raw = await asyncio.wait_for(reader.readline(), timeout=0.2)
@@ -414,18 +423,33 @@ class LabelManagerApp(App):
                     continue
                 if not raw:
                     continue
-                s = raw.decode(errors="ignore").rstrip("\r\n")
-                if s:
-                    lines.append(s)
+                    
+                line = raw.decode(errors="ignore").rstrip("\r\n")
+                if not line.strip():
+                    continue
+                    
+                # Process this line immediately for labels
+                if self._has_label_tokens(line):
+                    best_label_line = line
+                    labels = self._extract_labels(line)
+                    # Update fields registry immediately
+                    for lab in labels:
+                        if lab not in self.preset.fields:
+                            self.preset.fields[lab] = FieldDef(id=lab, label=lab)
+                    # Update UI immediately
+                    self.populate_fields()
+                else:
+                    # This is a data-only line
+                    best_data_line = line
+                    
         finally:
             try:
                 reader.feed_eof()
             except Exception:
                 pass
 
-        label_line = self._find_label_line(lines)
-        data_line = self._find_data_line(lines)
-        return (label_line, data_line)
+        return (best_label_line, best_data_line)
+
 
     def _find_label_line(self, lines: list[str]) -> str | None:
         for ln in lines:
