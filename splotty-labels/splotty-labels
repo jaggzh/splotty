@@ -15,6 +15,10 @@ from textual.message import Message
 from models import Preset, TreeNode as ModelNode, FieldDef
 from storage import Storage
 
+import re
+import serial_asyncio
+from serial.tools import list_ports
+
 # ---------- Helpers ----------
 
 def new_id(prefix: str = "n") -> str:
@@ -36,8 +40,11 @@ class HeaderBar(Static):
         )
 
 class SerialPreview(Static):
-    def set_preview(self, label_line: str, data_line: str) -> None:
-        self.update(f"{label_line}\n{data_line}")
+    def set_preview(self, label_line: str | None, data_line: str | None) -> None:
+        if label_line:
+            self.update(f"{label_line}\n{data_line or ''}".rstrip())
+        else:
+            self.update(f"{data_line or ''}".rstrip())
 
 class DynamicPane(Static):
     interactive: reactive[bool] = reactive(False)
@@ -55,9 +62,10 @@ class FieldsList(ListView):
     def on_mouse_down(self, event: events.MouseDown) -> None:
         # select the clicked item and initiate a drag intent
         if isinstance(event.sender, FieldsList):
-            # Textual selects by keyboard; we need to ensure selection follows click
-            if self.index is not None:
-                item = self.children[self.index]
+            pass
+            # # Textual selects by keyboard; we need to ensure selection follows click
+            # if self.index is not None:
+            #     item = self.children[self.index]
             # Find item by y coordinate approx: let Textual handle selection via click first
         # Let the click run default first so selection is updated
         self.post_message(self.StartDrag(self.selected_field_id, self.selected_field_label))
@@ -131,6 +139,8 @@ class LabelManagerApp(App):
         super().__init__()
         self.storage = Storage(storage_dir)
         self.preset = self.storage.load(preset_name)
+        self._mode: str | None = None
+        self._devsel: dict | None = None
 
     # ---------- Compose ----------
 
@@ -169,25 +179,16 @@ class LabelManagerApp(App):
 
         # Tree populate
         self.populate_tree()
-        # Fields populate (demo data if empty)
-        if not self.preset.fields:
-            demo = [
-                FieldDef(id="S1.raw", label="S1.raw"),
-                FieldDef(id="S2.raw", label="S2.raw"),
-                FieldDef(id="S1.xmax", label="S1.xmax"),
-                FieldDef(id="S1.xmax.sm", label="S1.xmax.sm"),
-                FieldDef(id="S1.xmin", label="S1.xmin"),
-                FieldDef(id="S1.xmin.sm", label="S1.xmin.sm"),
-            ]
-            for f in demo:
-                self.preset.fields[f.id] = f
+
         self.populate_fields()
 
         # Preview
         if self.preset.last_preview:
             self.preview.set_preview(
-                self.preset.last_preview.get("label_line", ""),
-                self.preset.last_preview.get("data_line", ""),
+                # self.preset.last_preview.get("label_line", ""),
+                # self.preset.last_preview.get("data_line", ""),
+                self.preset.last_preview.get("label_line"),
+                self.preset.last_preview.get("data_line"),
             )
 
         self.update_help_for_tree()
@@ -239,6 +240,33 @@ class LabelManagerApp(App):
 
     # ---------- Actions ----------
 
+    async def action_monitor(self) -> None:
+        secs = self.preset.monitor_secs
+        dev = self.preset.device
+        if not dev:
+            self.dynamic.update("No device set. Use Alt+d to choose a device.")
+            return
+        self.dynamic.update(f"Monitoring ({secs}s...)")
+        try:
+            label_line, data_line = await self._capture_and_parse(dev, self.preset.baud, secs)
+        except Exception as e:
+            self.dynamic.update(f"Monitor error: {e}")
+            return
+
+        # Update fields registry only if we saw a label line with key: tokens
+        if label_line:
+            labels = self._extract_labels(label_line)
+            for lab in labels:
+                fid = lab
+                if fid not in self.preset.fields:
+                    self.preset.fields[fid] = FieldDef(id=fid, label=fid)
+            self.populate_fields()
+
+        # Update preview (no placeholder/auto labels)
+        self.preset.last_preview = {"label_line": label_line, "data_line": data_line}
+        self.preview.set_preview(label_line, data_line)
+        self.dynamic.update("Monitor complete")
+
     def action_cycle_focus(self) -> None:
         self.focus_next()
         self.update_context_help()
@@ -248,10 +276,19 @@ class LabelManagerApp(App):
         self.dynamic.interactive = True
 
     def action_device_select(self) -> None:
-        # Simplified device selector into dynamic pane; you can wire real device list
-        valid = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0", "COM3", "COM4"]
-        current = self.preset.device or valid[0]
-        self.dynamic.update(f"{' '.join(valid)}  [Current: {current}]  (not editable in this stub)")
+        # Device selection UI in Dynamic pane (interactive)
+        try:
+            found = [p.device for p in list_ports.comports()]
+        except Exception:
+            found = []
+        valid = found or ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0", "COM3", "COM4"]
+        current = self.preset.device or (valid[0] if valid else "")
+        idx = valid.index(current) if current in valid else 0
+        self._mode = "devsel"
+        self._devsel = {"valid": valid, "index": idx}
+        self.dynamic.interactive = True
+        self._render_device_select()
+        self.set_focus(self.dynamic)
 
     def action_save_preset(self) -> None:
         self.storage.save(self.preset)
@@ -362,6 +399,50 @@ class LabelManagerApp(App):
         if i > 0:
             self._select_node(flat[i - 1])
 
+    async def _capture_and_parse(self, device: str, baud: int, seconds: int) -> tuple[str | None, str | None]:
+        reader, _ = await serial_asyncio.open_serial_connection(url=device, baudrate=baud)
+        lines: list[str] = []
+        loop = asyncio.get_running_loop()
+        end = loop.time() + seconds
+        try:
+            while loop.time() < end:
+                try:
+                    raw = await asyncio.wait_for(reader.readline(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+                if not raw:
+                    continue
+                s = raw.decode(errors="ignore").rstrip("\r\n")
+                if s:
+                    lines.append(s)
+        finally:
+            try:
+                reader.feed_eof()
+            except Exception:
+                pass
+
+        label_line = self._find_label_line(lines)
+        data_line = self._find_data_line(lines)
+        return (label_line, data_line)
+
+    def _find_label_line(self, lines: list[str]) -> str | None:
+        for ln in lines:
+            if self._has_label_tokens(ln):
+                return ln
+        return None
+
+    def _find_data_line(self, lines: list[str]) -> str | None:
+        for ln in reversed(lines):
+            if not self._has_label_tokens(ln) and ln.strip():
+                return ln
+        return None
+
+    def _has_label_tokens(self, line: str) -> bool:
+        return bool(re.search(r"(?:^|\\s)[^\\s:]+\\s*:", line))
+
+    def _extract_labels(self, line: str) -> list[str]:
+        return [m.group(1) for m in re.finditer(r"(?:^|\\s)([^\\s:]+)\\s*:", line)]
+
     def action_tree_edit_or_insert(self) -> None:
         # For brevity, toggle rename on branches; inserting from fields is via Enter in Fields or drop
         tnode, mnode = self.current_model_node()
@@ -370,17 +451,6 @@ class LabelManagerApp(App):
             self.dynamic.update(f"Rename '{mnode.name}' not implemented in stub")
         else:
             self.dynamic.update("Leaf selected")
-
-    # Monitor stub
-    async def action_monitor(self) -> None:
-        secs = self.preset.monitor_secs
-        self.dynamic.update(f"Monitoring ({secs}s...)")
-        await asyncio.sleep(0.1)
-        label = "s1raw: s1ema: s2raw: s2ema:"
-        data = "51 50 32 30"
-        self.preset.last_preview = {"label_line": label, "data_line": data}
-        self.preview.set_preview(label, data)
-        self.dynamic.update("Monitor complete (stub)")
 
     # ---------- Insertion logic ----------
 
@@ -421,8 +491,44 @@ class LabelManagerApp(App):
 
     def on_key(self, event: events.Key) -> None:
         if getattr(self.dynamic, "interactive", False):
+            # --- Device select mode ---
+            if self._mode == "devsel":
+                if event.key in ("up",):
+                    if self._devsel and self._devsel["valid"]:
+                        self._devsel["index"] = (self._devsel["index"] - 1) % len(self._devsel["valid"])
+                        self._render_device_select()
+                    return
+                if event.key in ("down",):
+                    if self._devsel and self._devsel["valid"]:
+                        self._devsel["index"] = (self._devsel["index"] + 1) % len(self._devsel["valid"])
+                        self._render_device_select()
+                    return
+                if event.key in ("enter",):
+                    if self._devsel and self._devsel["valid"]:
+                        choice = self._devsel["valid"][self._devsel["index"]]
+                        self.preset.device = choice
+                        self.header.device = choice
+                        self.dynamic.update(f"Device set: {choice}")
+                    self._mode = None
+                    self._devsel = None
+                    self.dynamic.interactive = False
+                    return
+                if event.key in ("escape",):
+                    self.dynamic.update("")
+                    self._mode = None
+                    self._devsel = None
+                    self.dynamic.interactive = False
+                    return
+                if event.key == "q":
+                    # Exit device-select then forward to quit
+                    self.dynamic.update("")
+                    self._mode = None
+                    self._devsel = None
+                    self.dynamic.interactive = False
+                    self.action_quit_confirm()
+                    return
+            # --- Generic confirm mode (y/N) ---
             if event.key == "y":
-                # Handle pending operations
                 if hasattr(self, "_pending_delete") and self._pending_delete:
                     self._delete_subtree(self._pending_delete)
                     self._pending_delete = None
@@ -430,9 +536,12 @@ class LabelManagerApp(App):
                 elif self.dynamic.renderable and "Quit?" in str(self.dynamic.renderable):
                     self.exit()
                 self.dynamic.interactive = False
-            elif event.key in ("escape", "n"):
+                return
+            if event.key in ("escape", "n"):
                 self.dynamic.update("")
                 self.dynamic.interactive = False
+                return
+
 
     def _delete_subtree(self, node_id: str) -> None:
         node = self.preset.tree_nodes[node_id]
@@ -448,6 +557,18 @@ class LabelManagerApp(App):
             parent.children = [c for c in parent.children if c != node_id]
         self.populate_tree()
 
+    def _render_device_select(self) -> None:
+        if not self._devsel:
+            return
+        valid = self._devsel["valid"]
+        idx = self._devsel["index"]
+        if not valid:
+            self.dynamic.update("No serial devices found. (Esc) to cancel")
+            return
+        line = " ".join(f"[{v}]" if i == idx else v for i, v in enumerate(valid))
+        current = valid[idx]
+        self.dynamic.update(f"{line}   [Current: {current}]  (Up/Down, Enter to set, Esc to cancel)")
+
     # ---------- Contextual help ----------
 
     def update_context_help(self) -> None:
@@ -455,8 +576,11 @@ class LabelManagerApp(App):
             self.update_help_for_tree()
         elif self.focused is self.fields:
             self.helpbar.update("(h/j) up/down   (Enter) Add to tree   (Drag) drop onto Tree")
+        elif self.focused is self.dynamic and self._mode == "devsel":
+            self.helpbar.update("Device select: (Up/Down) choose  (Enter) set  (Esc) cancel  (q) quit")
         else:
             self.helpbar.update("")
+
 
     def update_help_for_tree(self) -> None:
         self.helpbar.update("[Tab]  [Add: (a)Child (o)Sibling]  (Enter)Edit  (M)onitor  (h/H)collapse  (l/L)expand  (J/K)move  (Alt-j/k)reparent  (-)delete")

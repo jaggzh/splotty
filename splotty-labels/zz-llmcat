@@ -1,0 +1,11 @@
+#!/bin/bash
+cmd=(
+	ls-cat-for-llm
+		PURPOSE-FUNCTION-TUI-SPECS-AND-FUTURE.md
+		requirements.txt
+		splotty-labels
+		models.py
+		storage.py
+		textual.css
+)
+"${cmd[@]}"
