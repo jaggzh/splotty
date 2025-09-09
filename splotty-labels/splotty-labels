@@ -129,9 +129,10 @@ class LabelManagerApp(App):
         ("J", "tree_move_down", None),
         ("K", "tree_move_up", None),
         ("-", "tree_delete", None),
+        ("delete", "tree_delete", None),
         ("a", "tree_add_child", None),
         ("o", "tree_add_sibling", None),
-        ("enter", "tree_edit_or_insert", None),
+        ("e", "tree_edit_or_insert", None),
     ]
 
     dragging_field: str | None = None  # global drag payload (field id)
@@ -142,6 +143,9 @@ class LabelManagerApp(App):
         self.preset = self.storage.load(preset_name)
         self._mode: str | None = None
         self._devsel: dict | None = None
+        self._edit_target: str | None = None
+        self._edit_text: str = ""
+        self._edit_cursor: int = 0
 
     # ---------- Compose ----------
 
@@ -195,8 +199,19 @@ class LabelManagerApp(App):
         self.update_help_for_tree()
 
     # ---------- Populate widgets ----------
+    def populate_tree(self, offset=None) -> None:
+        # current = self.group_tree.cursor_node or self.group_tree.root
+        # current_model_id = current.data if current.data else self.preset.root_id
+        # flat = self._visible_nodes()
 
-    def populate_tree(self) -> None:
+        # nodes = self.preset.tree_nodes
+        # node_cnt = len(nodes)
+        # try:
+        #     i = flat.index(current)
+        # # except ValueError as e:
+        # except Exception as e:
+        #     self.dynamic.update(f"Failed to get cur_idx: {e}")
+        #     cur_idx = 0
         self.group_tree.root.label = self.preset.tree_nodes[self.preset.root_id].name
         self.group_tree.root.allow_expand = True
         self.group_tree.root.expand()
@@ -214,7 +229,10 @@ class LabelManagerApp(App):
                     add_children(tnode, child_id)
         add_children(self.group_tree.root, self.preset.root_id)
         self.group_tree.show_root = True
+        # if offset is not None: cur_idx += offset
+        # cur_idx = min(max(0,cur_idx), node_cnt)
         self.group_tree.select_node(self.group_tree.root)
+
 
     def populate_fields(self) -> None:
         self.fields.clear()
@@ -269,13 +287,14 @@ class LabelManagerApp(App):
         self.dynamic.update("Monitor complete")
 
     def action_cycle_focus(self) -> None:
-        self.focus_next()
+        # self.focus_next()
         self.update_context_help()
 
     def action_quit_confirm(self) -> None:
         self.dynamic.update("Quit? (y/N)")
         self.dynamic.interactive = True
         self._pending_quit = True
+        self._pending_confirm = True
 
     def action_device_select(self) -> None:
         # Device selection UI in Dynamic pane (interactive)
@@ -392,6 +411,7 @@ class LabelManagerApp(App):
             self._select_node(flat[i + 1])
 
     def action_tree_up(self) -> None:
+        self.dynamic.update(f"UP")
         current = self.group_tree.cursor_node or self.group_tree.root
         flat = self._visible_nodes()
         try:
@@ -470,11 +490,15 @@ class LabelManagerApp(App):
         return [m.group(1) for m in re.finditer(r"(?:^|\s)([^\s:]+)\s*:", line)]
 
     def action_tree_edit_or_insert(self) -> None:
-        # For brevity, toggle rename on branches; inserting from fields is via Enter in Fields or drop
         tnode, mnode = self.current_model_node()
         if mnode.type == "branch":
-            # simple inline rename via dynamic prompt (stub)
-            self.dynamic.update(f"Rename '{mnode.name}' not implemented in stub")
+            # Start editing the branch name
+            self._mode = "edit_name"
+            self._edit_target = mnode.id
+            self._edit_text = mnode.name
+            self._edit_cursor = len(mnode.name)
+            self.dynamic.update(f"Edit name: {self._edit_text}")
+            self.dynamic.interactive = True
         else:
             self.dynamic.update("Leaf selected")
 
@@ -516,21 +540,55 @@ class LabelManagerApp(App):
     # ---------- Global key routing to implement y/N confirms ----------
 
     def on_key(self, event: events.Key) -> None:
-        self.dynamic.update(f"DEBUG: Key pressed: {event.key!r}")
         if getattr(self.dynamic, "interactive", False):
+            # if event.key == 'tab': # not working
+            #     sys.exit()
+            #     self.action_cycle_focus()
+            # if self.focused is self.group_tree:
+            if self._mode == "edit_name":
+                if event.key == 'enter':
+                    # Confirm edit
+                    if self._edit_text.strip():
+                        target_node = self.preset.tree_nodes[self._edit_target]
+                        target_node.name = self._edit_text.strip()
+                        self.preset.name = self._edit_text.strip()
+                        self.populate_tree()
+                        # self.dynamic.update(f"Renamed to '{self._edit_text.strip()}'")
+                    else:
+                        self.dynamic.update("Name cannot be empty")
+                    self._mode = None
+                    self.dynamic.interactive = False
+                elif event.key == "escape":
+                    # Cancel edit
+                    self.dynamic.update("Edit cancelled")
+                    self._mode = None
+                    self.dynamic.interactive = False
+                elif event.key == "backspace":
+                    # Delete character
+                    if self._edit_text:
+                        self._edit_text = self._edit_text[:-1]
+                        self.dynamic.update(f"Edit name: {self._edit_text}")
+                elif len(event.key) == 1 and event.key.isprintable():
+                    # Add character
+                    self._edit_text += event.key
+                    self.dynamic.update(f"Edit name: {self._edit_text}")
+                else:
+                    tree_node_count = len(self.preset.tree_nodes)
+                    self.dynamic.update(f"DEBUG: Key pressed: {event.key!r} (Nodes: {tree_node_count})")
+                event.prevent_default()
+                # Consume all other keys
+                return
             # --- Device select mode ---
-            if self._mode == "devsel":
+            elif self._mode == "devsel":
                 if event.key in ("up",):
                     if self._devsel and self._devsel["valid"]:
                         self._devsel["index"] = (self._devsel["index"] - 1) % len(self._devsel["valid"])
                         self._render_device_select()
-                    return
-                if event.key in ("down",):
+                elif event.key in ("down",):
                     if self._devsel and self._devsel["valid"]:
                         self._devsel["index"] = (self._devsel["index"] + 1) % len(self._devsel["valid"])
                         self._render_device_select()
-                    return
-                if event.key in ("enter",):
+                elif event.key in ("enter",):
                     if self._devsel and self._devsel["valid"]:
                         choice = self._devsel["valid"][self._devsel["index"]]
                         self.preset.device = choice
@@ -539,45 +597,45 @@ class LabelManagerApp(App):
                     self._mode = None
                     self._devsel = None
                     self.dynamic.interactive = False
-                    return
-                if event.key in ("escape",):
+                elif event.key in ("escape",):
                     self.dynamic.update("")
                     self._mode = None
                     self._devsel = None
                     self.dynamic.interactive = False
-                    return
-                if event.key == "q":
+                elif event.key == "q":
                     # Exit device-select then forward to quit
                     self.dynamic.update("")
                     self._mode = None
                     self._devsel = None
                     self.dynamic.interactive = False
                     self.action_quit_confirm()
-                    return
-                # Consume all other keys in device selection mode to prevent fallthrough
+                else:
+                    self.dynamic.update(f"DEBUG: Key pressed: {event.key!r}")
+                event.prevent_default()
                 return
             # --- Generic confirm mode (y/N) ---
-            if event.key == "y":
-                if hasattr(self, "_pending_delete") and self._pending_delete:
-                    self._delete_subtree(self._pending_delete)
-                    self._pending_delete = None
-                    self.dynamic.update("Deleted.")
-                elif self.dynamic.renderable and "Quit?" in str(self.dynamic.renderable):
-                    self.exit()
-                else:
-                    # Add a fallback quit check
-                    if hasattr(self, "_pending_quit") and self._pending_quit:
+            elif getattr(self, "_pending_confirm", False):
+                # self.dynamic.update(f"DEBUG: Key pressed: {event.key!r}")
+                if event.key == "y":
+                    if getattr(self, "_pending_delete", False):
+                        self._delete_subtree(self._pending_delete)
+                        self._pending_delete = None
+                        self.dynamic.update("Deleted.")
+                    # elif self.dynamic.renderable and "Quit?" in str(self.dynamic.renderable):
+                    elif self.dynamic.renderable and getattr(self, "_pending_quit"):
                         self.exit()
-                self.dynamic.interactive = False
+                        return # let exit event be handled
+                    self.dynamic.interactive = False
+                    self._pending_confirm = False
+                elif event.key in ('n','escape'):
+                    self.dynamic.update("")
+                    self.dynamic.interactive = False
+                    if getattr(self, "_pending_quit", False):
+                        self._pending_quit = False
+                    self._pending_confirm = False
+                self.dynamic.update(f"DEBUG: Key pressed: {event.key!r}")
+                event.prevent_default()
                 return
-
-            if event.key in ("n"):
-                self.dynamic.update("")
-                self.dynamic.interactive = False
-                if hasattr(self, "_pending_quit"):
-                    self._pending_quit = False
-                return
-
 
     def _delete_subtree(self, node_id: str) -> None:
         node = self.preset.tree_nodes[node_id]
@@ -619,7 +677,7 @@ class LabelManagerApp(App):
 
 
     def update_help_for_tree(self) -> None:
-        self.helpbar.update("[Tab]  [Add: (a)Child (o)Sibling]  (Enter)Edit  (M)onitor  (h/H)collapse  (l/L)expand  (J/K)move  (Alt-j/k)reparent  (-)delete")
+        self.helpbar.update("[Tab]  [Add: (a)Child (o)Sibling]  (e)Edit  (M)onitor  (h/H)collapse  (l/L)expand  (J/K)move  (Alt-j/k)reparent  (-)delete")
 
 # ---------- CLI ----------
 
