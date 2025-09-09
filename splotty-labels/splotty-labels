@@ -11,6 +11,9 @@ from textual.widgets._tree import TreeNode as TextualTreeNode
 from textual import events
 from textual.reactive import reactive
 from textual.message import Message
+from textual import log
+from typing import Iterator, List, Optional, Tuple
+
 
 from models import Preset, TreeNode as ModelNode, FieldDef
 from storage import Storage
@@ -24,6 +27,86 @@ from serial.tools import list_ports
 
 def new_id(prefix: str = "n") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _get_cursor_node(tree: Tree) -> Optional[TreeNode]:
+    """Return the current cursor node regardless of Textual minor version differences."""
+    # Newer Textual versions often expose `cursor_node`; older expose `cursor` (node id) + get_node
+    if hasattr(tree, "cursor_node"):
+        return tree.cursor_node  # type: ignore[attr-defined]
+    if hasattr(tree, "cursor"):
+        node_id = tree.cursor  # type: ignore[attr-defined]
+        if node_id is not None and hasattr(tree, "get_node"):
+            try:
+                return tree.get_node(node_id)
+            except Exception:
+                return None
+    return None
+
+
+def _iter_visible_nodes(root: TreeNode) -> Iterator[TreeNode]:
+    """Preorder traversal of nodes as the user sees them (respects expansion)."""
+    stack: List[TreeNode] = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        # Only descend if node is expanded or cannot expand (i.e., leaf)
+        can_expand = getattr(node, "allow_expand", False)
+        is_expanded = getattr(node, "expanded", False)
+        if (not can_expand) or is_expanded:
+            # Push children in reverse so we pop in natural order
+            children = list(getattr(node, "children", []))
+            for child in reversed(children):
+                stack.append(child)
+
+
+def _visible_nodes(tree: Tree) -> List[TreeNode]:
+    """Materialize the visible node list for indexing."""
+    return list(_iter_visible_nodes(tree.root))
+
+
+def _tree_get_cursor_idx(tree: Tree) -> Tuple[int, int]:
+    """
+    Return (cursor_index, visible_count).
+    If there is no cursor node, returns (0, visible_count) as a safe default.
+    """
+    nodes = _visible_nodes(tree)
+    cursor = _get_cursor_node(tree)
+    if cursor is None:
+        return 0, len(nodes)
+    try:
+        return nodes.index(cursor), len(nodes)
+    except ValueError:
+        # Cursor node not visible (e.g., collapsed above); default to 0
+        return 0, len(nodes)
+
+
+def _expand_to_node(node: TreeNode) -> None:
+    """Ensure all ancestors are expanded so `node` is visible."""
+    parent = getattr(node, "parent", None)
+    while parent is not None:
+        # Only expand if it can expand
+        if getattr(parent, "allow_expand", False):
+            parent.expand()
+        parent = getattr(parent, "parent", None)
+
+
+def _tree_set_selected_by_idx(tree: Tree, idx: int, *, auto_expand: bool = True, clamp: bool = True) -> int:
+    """
+    Select the visible node at `idx`. Returns the index actually selected (after clamping).
+    If `auto_expand` is True, expands ancestors so the node is visible.
+    """
+    nodes = _visible_nodes(tree)
+    if not nodes:
+        return 0
+    if clamp:
+        idx = max(0, min(idx, len(nodes) - 1))
+    target = nodes[idx]
+    if auto_expand:
+        _expand_to_node(target)
+    # This sets the cursor, scrolls into view, and emits the selected event
+    tree.select_node(target)
+    return idx
 
 # ---------- Widgets ----------
 
@@ -199,40 +282,39 @@ class LabelManagerApp(App):
         self.update_help_for_tree()
 
     # ---------- Populate widgets ----------
-    def populate_tree(self, offset=None) -> None:
-        # current = self.group_tree.cursor_node or self.group_tree.root
-        # current_model_id = current.data if current.data else self.preset.root_id
-        # flat = self._visible_nodes()
 
-        # nodes = self.preset.tree_nodes
-        # node_cnt = len(nodes)
-        # try:
-        #     i = flat.index(current)
-        # # except ValueError as e:
-        # except Exception as e:
-        #     self.dynamic.update(f"Failed to get cur_idx: {e}")
-        #     cur_idx = 0
+    def populate_tree(self, offset: Optional[int] = None) -> None:
+        # 1) Remember current cursor index among visible nodes
+        cur_idx, visible_cnt = _tree_get_cursor_idx(self.group_tree)
+
+        # 2) Rebuild from your model
         self.group_tree.root.label = self.preset.tree_nodes[self.preset.root_id].name
         self.group_tree.root.allow_expand = True
         self.group_tree.root.expand()
         self.group_tree.clear()
-        # rebuild textual tree from model
-        def add_children(parent_txt_node: TextualTreeNode, parent_id: str):
+
+        def add_children(parent_txt_node: TreeNode, parent_id: str):
             parent_model = self.preset.tree_nodes[parent_id]
             for child_id in parent_model.children:
                 m = self.preset.tree_nodes[child_id]
                 label = m.name if m.type == "branch" else f"f {m.name}"
                 tnode = parent_txt_node.add(label, expand=m.expanded)
-                tnode.allow_expand = m.type == "branch"
+                tnode.allow_expand = (m.type == "branch")
                 tnode.data = child_id
                 if m.type == "branch":
                     add_children(tnode, child_id)
+
         add_children(self.group_tree.root, self.preset.root_id)
         self.group_tree.show_root = True
-        # if offset is not None: cur_idx += offset
-        # cur_idx = min(max(0,cur_idx), node_cnt)
-        self.group_tree.select_node(self.group_tree.root)
 
+        # 3) Compute the target index with optional offset and clamp
+        if offset is None:
+            target_idx = cur_idx
+        else:
+            target_idx = cur_idx + offset
+
+        # 4) Select by index, auto-expanding ancestors so it's visible
+        _tree_set_selected_by_idx(self.group_tree, target_idx, auto_expand=True, clamp=True)
 
     def populate_fields(self) -> None:
         self.fields.clear()
@@ -622,7 +704,8 @@ class LabelManagerApp(App):
                         self._pending_delete = None
                         self.dynamic.update("Deleted.")
                     # elif self.dynamic.renderable and "Quit?" in str(self.dynamic.renderable):
-                    elif self.dynamic.renderable and getattr(self, "_pending_quit"):
+                    # elif self.dynamic.renderable and getattr(self, "_pending_quit"):
+                    elif getattr(self, "_pending_quit"):
                         self.exit()
                         return # let exit event be handled
                     self.dynamic.interactive = False
@@ -699,3 +782,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# vim: et
