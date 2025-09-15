@@ -7,6 +7,7 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static, Tree, ListView, ListItem, Label, Footer
+from textual.containers import VerticalScroll
 from textual.widgets._tree import TreeNode as TextualTreeNode
 from textual import events
 from textual.reactive import reactive
@@ -86,6 +87,7 @@ def _expand_to_node(node: TreeNode) -> None:
     parent = getattr(node, "parent", None)
     while parent is not None:
         # Only expand if it can expand
+        parent.allow_expand = True
         if getattr(parent, "allow_expand", False):
             parent.expand()
         parent = getattr(parent, "parent", None)
@@ -248,7 +250,11 @@ class LabelManagerApp(App):
         yield self.preview
 
         self.dynamic = DynamicPane(id="dynamic-pane")
-        yield self.dynamic
+        # yield self.dynamic
+        yield VerticalScroll(self.dynamic,
+                             id='dynamic-vscroll',
+                             can_focus=True)
+
 
         self.helpbar = HelpBar(id="help-line")
         yield self.helpbar
@@ -301,11 +307,16 @@ class LabelManagerApp(App):
                 tnode = parent_txt_node.add(label, expand=m.expanded)
                 tnode.allow_expand = (m.type == "branch")
                 tnode.data = child_id
+                tnode.expand()
+                # tnode.expand_all()
                 if m.type == "branch":
                     add_children(tnode, child_id)
 
         add_children(self.group_tree.root, self.preset.root_id)
         self.group_tree.show_root = True
+        self.group_tree.root.expand()
+        # self.group_tree.root.expand_all()
+        # self.dynamic.update(f"f{self.group_tree.root.expand_all}")
 
         # 3) Compute the target index with optional offset and clamp
         if offset is None:
@@ -315,6 +326,8 @@ class LabelManagerApp(App):
 
         # 4) Select by index, auto-expanding ancestors so it's visible
         _tree_set_selected_by_idx(self.group_tree, target_idx, auto_expand=True, clamp=True)
+        self.group_tree.expand_node(self.group_tree.root)
+        self.group_tree.refresh()
 
     def populate_fields(self) -> None:
         self.fields.clear()
@@ -377,6 +390,7 @@ class LabelManagerApp(App):
         self.dynamic.interactive = True
         self._pending_quit = True
         self._pending_confirm = True
+        self.exit()
 
     def action_device_select(self) -> None:
         # Device selection UI in Dynamic pane (interactive)
@@ -407,11 +421,53 @@ class LabelManagerApp(App):
         tnode, mnode = self.current_model_node()
         if mnode.type != "branch":
             return
+        if not mnode.expanded:
+            mnode.action_select_cursor()
+        # self.group_tree.action_toggle_node()
+        # self.dynamic.update(f"tog{mnode.__dict__}", layout=True)
+        self.dynamic.update(f"tog {mnode.type}", layout=True)
+        # self.dynamic.update(f"tog{self.group_tree.action_select_cursor}")
+        # self.dynamic.update(f"exp{mnode.expanded}")
+
+        # Make new branch node
         nid = new_id("b")
         new = ModelNode(id=nid, name=self.unique_child_name(mnode, "New"), type="branch", parent_id=mnode.id)
         self.preset.tree_nodes[nid] = new
         mnode.children.append(nid)
-        self.populate_tree()
+
+        # Expand the parent so we can see the child
+        # mnode.expanded = True
+
+        # Select the new node (get future index of it)
+        def compute_index_of_node_in_future_tree() -> int:
+            # Simulate new tree, walk visible, find node with .data == nid
+            class DummyNode:
+                def __init__(self, model_id): self.data = model_id
+                children = [];
+                # expanded = True;
+                allow_expand = True;
+                parent = None
+            def build_dummy(node_id: str):
+                m = self.preset.tree_nodes[node_id]
+                dummy = DummyNode(node_id)
+                # dummy.expanded = m.expanded
+                dummy.allow_expand = m.type == "branch"
+                dummy.children = [build_dummy(c) for c in m.children]
+                for c in dummy.children: c.parent = dummy
+                return dummy
+            dummy_root = build_dummy(self.preset.root_id)
+            vis = list(_iter_visible_nodes(dummy_root))
+            for i, n in enumerate(vis):
+                if n.data == nid:
+                    return i
+            return 0
+
+        idx = compute_index_of_node_in_future_tree()
+        self.populate_tree(offset=idx)
+        # self.group_tree.root.expand_all()
+        self.group_tree.root._expand(True)
+        self.dynamic.update(str(dir(self.group_tree.root)))
+        # self.dynamic.update(str(dir(self.group_tree.root.__dict__))
 
     def action_tree_add_sibling(self) -> None:
         tnode, mnode = self.current_model_node()

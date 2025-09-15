@@ -30,8 +30,14 @@ Screen {
 
 #dynamic-pane {
   height: auto;
-  max-height: 3;
-  overflow: auto;
+  max-height: 8;
+  /* overflow: auto; */
+  /* border: tall $accent-darken-2; */
+}
+#dynamic-vscroll {
+  height: auto;
+  max-height: 6;
+  overflow-y: scroll;
   border: tall $accent-darken-2;
 }
 
