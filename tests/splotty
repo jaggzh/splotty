@@ -265,16 +265,22 @@ sub recompute_layout {
 
     $plot_left   = $yaxis_w + $pad_left + 1;      # 1-based columns
     $legend_width = calculate_legend_width();     # dynamic width calculation
-    $plot_right  = $COLS - $pad_right - $legend_width - 5;
+    $plot_right  = $COLS - $pad_right - $legend_width - 3;  # space for: border(1) + gap(1) + legend(width)
     $plot_right  = $plot_left if $plot_right < $plot_left;
     $plot_width  = $plot_right - $plot_left + 1;
 
-    $legend_col_start = $plot_right + 2;          # legend gutter start column
+    $legend_col_start = $plot_right + 3;          # plot_area + border + gap + legend
+    # Ensure legend doesn't overflow terminal width
+    if ($legend_col_start + $legend_width > $COLS) {
+        $legend_col_start = $COLS - $legend_width;
+        $legend_col_start = 1 if $legend_col_start < 1;
+    }
     
     # Check if legend width changed and trigger redraw if needed
     if ($legend_width != $last_legend_width) {
         $need_redraw = 1;
         print STDERR "Legend width changed: $last_legend_width -> $legend_width\n" if $last_legend_width > 0;
+        print STDERR "Layout: plot_left=$plot_left, plot_right=$plot_right, legend_start=$legend_col_start, COLS=$COLS\n";
         $last_legend_width = $legend_width;
     }
 }
@@ -296,7 +302,7 @@ sub draw_header {
     for my $r (1..$opt{header}) {
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
         my $mode = $opt{demo_mode} ? "DEMO" : "SERIAL";
-        my $port_info = $opt{demo_mode} ? "" : " ($opt{serial_port}\@$opt{baud_rate})";
+        my $port_info = $opt{demo_mode} ? "" : " (ttyACM1\@115200)";
         my $label = $r==1 ? " Serial Data Plotter [$mode]$port_info " : "";
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         $line = substr($line, 0, $COLS-1);
@@ -310,8 +316,9 @@ sub draw_footer {
     for my $i (0..$opt{footer}-1) {
         my $r = $ROWS - $opt{footer} + 1 + $i;
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
+        my $gap = $legend_col_start - $plot_right - 1;
         my $label = $i==0
-          ? " Footer — q=quit  N=toggle field numbers  (Fields: $S, Legend: ${legend_width}ch) "
+          ? " Footer — q=quit  N=toggle field numbers  (Fields: $S, Legend: ${legend_width}ch, Gap: $gap) "
           : "";
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         $line = substr($line, 0, $COLS-1);
@@ -433,21 +440,24 @@ sub build_plot_row {
                     my $num_s = "$num";
                     for (my $k=0; $k<length($num_s); $k++) {
                         my $cc = $col + $k;
-                        last if $cc > $plot_right;
+                        last if $cc > $plot_right;  # stay within plot boundaries  # stay within plot boundaries
                         $buf[$cc-1] = ($opt{no_color} ? "" : fg256($color)) . substr($num_s,$k,1) . reset_attrs_str();
                     }
                 }
-            }
+			}
         }
     }
 
     # optional subtle left/right borders for the plot area
     my $border_col = 244;
+    # Left border: one column before plot area
     if ($plot_left-1 >= 1) {
         $buf[$plot_left-2] = fg256($border_col) . '│' . reset_attrs_str();
     }
-    if ($plot_right+1 <= $COLS) {
-        $buf[$plot_right] = fg256($border_col) . '│' . reset_attrs_str();
+    # Right border: one column after plot area  
+    my $right_border_col = $plot_right + 1;
+    if ($right_border_col <= $COLS) {
+        $buf[$right_border_col-1] = fg256($border_col) . '│' . reset_attrs_str();
     }
 
     # Return the visible line covering the whole width
