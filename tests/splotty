@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use utf8;
 use Getopt::Long;
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 
 binmode STDOUT, ':encoding(UTF-8)';
 
@@ -10,10 +11,13 @@ binmode STDOUT, ':encoding(UTF-8)';
 my %opt = (
     header   => 2,     # fixed header lines; 0 to disable
     footer   => 2,     # fixed footer lines; 0 to disable
-    series   => 4,     # how many fields (series)
+    series   => 4,     # how many fields (series) - will be dynamic with serial
     window   => 30,    # autorange window (rows) across all series
     delay_ms => 0,     # inter-row delay in ms; default off (0)
     no_color => 0,     # disable color
+    serial_port => '/dev/ttyACM1',  # default serial port
+    baud_rate => 115200,            # default baud rate
+    demo_mode => 0,                 # use fake data instead of serial
 );
 GetOptions(
     'header=i'      => \$opt{header},
@@ -22,6 +26,9 @@ GetOptions(
     'window=i'      => \$opt{window},
     'delay_ms|d=i'  => \$opt{delay_ms},
     'no-color!'     => \$opt{no_color},
+    'serial-port=s' => \$opt{serial_port},
+    'baud-rate=i'   => \$opt{baud_rate},
+    'demo!'         => \$opt{demo_mode},
 ) or die "Bad options\n";
 
 # ---------------- Term & ANSI helpers ----------------
@@ -69,21 +76,177 @@ my $pad_right = 1;       # small right pad
 my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
 my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
 
+# ---------------- Serial Data ----------------
+my $serial_fh;
+my $serial_buffer = '';
+
+sub open_serial_port {
+    my $port = $opt{serial_port};
+    my $baud = $opt{baud_rate};
+    
+    # Configure the serial port using stty
+    system("stty -F $port $baud cs8 -cstopb -parity raw -echo") == 0
+        or die "Failed to configure serial port $port: $!\n";
+    
+    # Open the serial port
+    open($serial_fh, '<', $port) or die "Cannot open serial port $port: $!\n";
+    
+    # Make it non-blocking
+    my $flags = fcntl($serial_fh, F_GETFL, 0) or die "fcntl F_GETFL: $!\n";
+    fcntl($serial_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL: $!\n";
+    
+    print STDERR "Opened serial port $port at $baud baud\n";
+}
+
+sub read_serial_data {
+    return unless $serial_fh;
+    
+    my $data;
+    my $bytes_read = sysread($serial_fh, $data, 1024);
+    return unless defined $bytes_read && $bytes_read > 0;
+    
+    $serial_buffer .= $data;
+    
+    my @lines;
+    while ($serial_buffer =~ s/^([^\n]*)\n//) {
+        push @lines, $1;
+    }
+    
+    return @lines;
+}
+
 # ---------------- Data ----------------
 my $S = $opt{series};
 my @values;          # current values (length S)
+my @field_names;     # field names for each series
 my @hist;            # history ring buffers per series (array of arrayrefs)
 my $hsize = $opt{window};
+
+# For demo mode - keep the original random data
 my @start = map { 50 + rand()*50 } (1..$S);
 my @vol   = map { 6 + rand()*6 }   (1..$S);
-for my $i (0..$S-1) {
-    $values[$i] = $start[$i];
-    $hist[$i]   = [];
+
+sub init_data {
+    if ($opt{demo_mode}) {
+        # Initialize demo data
+        @field_names = map { "field$_" } (1..$S);
+        for my $i (0..$S-1) {
+            $values[$i] = $start[$i];
+            $hist[$i]   = [];
+        }
+    } else {
+        # Initialize empty for serial data
+        @values = ();
+        @field_names = ();
+        @hist = ();
+        $S = 0;
+    }
+}
+
+sub parse_arduino_line {
+    my ($line) = @_;
+    chomp $line;
+    $line =~ s/\r//g;  # remove carriage returns
+    
+    my @fields = split /\t/, $line;
+    my (@names, @vals);
+    
+    for my $i (0..$#fields) {
+        my $field = $fields[$i];
+        if ($field =~ /^([^:]+):([+-]?(?:\d+\.?\d*|\.\d+))$/) {
+            # Has label: "label:value"
+            push @names, $1;
+            push @vals, $2 + 0;  # convert to number
+        } elsif ($field =~ /^([+-]?(?:\d+\.?\d*|\.\d+))$/) {
+            # No label, just value: "value"
+            push @names, ($i + 1);  # 1-indexed field number
+            push @vals, $1 + 0;
+        } else {
+            # Skip malformed fields
+            next;
+        }
+    }
+    
+    return (\@names, \@vals);
+}
+
+sub update_fields {
+    my ($new_names, $new_values) = @_;
+    
+    # Check if field structure has changed
+    my $structure_changed = 0;
+    if (@$new_names != @field_names) {
+        $structure_changed = 1;
+    } else {
+        for my $i (0..$#field_names) {
+            if ($field_names[$i] ne $new_names->[$i]) {
+                $structure_changed = 1;
+                last;
+            }
+        }
+    }
+    
+    if ($structure_changed) {
+        # Rebuild data structures
+        @field_names = @$new_names;
+        $S = @field_names;
+        @values = @$new_values;
+        @hist = map { [] } (0..$S-1);
+        $need_redraw = 1;
+        print STDERR "Field structure changed: " . join(", ", @field_names) . "\n";
+    } else {
+        # Update values
+        @values = @$new_values;
+    }
+    
+    # Update history
+    for my $i (0..$S-1) {
+        push @{$hist[$i]}, $values[$i];
+        shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
+    }
+    
+    # Recompute layout in case legend width changed
+    recompute_layout();
 }
 
 # ---------------- Mapping helpers ----------------
 my ($plot_top, $plot_bottom, $plot_height, $plot_left, $plot_right, $plot_width);
-my ($legend_col_start);
+my ($legend_col_start, $legend_width);
+my $last_legend_width = 0;
+
+sub calculate_legend_width {
+    return 16 if $S == 0;  # Default width when no data
+    
+    my $max_width = 0;
+    for my $i (0..$S-1) {
+        my $name = $field_names[$i] // ($i + 1);
+        my $value_str;
+        if (defined $values[$i]) {
+            # Format numbers based on magnitude for better display
+            my $val = $values[$i];
+            if (abs($val) >= 1000) {
+                $value_str = sprintf("%.0f", $val);
+            } elsif (abs($val) >= 100) {
+                $value_str = sprintf("%.1f", $val);
+            } elsif (abs($val) >= 10) {
+                $value_str = sprintf("%.2f", $val);
+            } else {
+                $value_str = sprintf("%.3f", $val);
+            }
+        } else {
+            $value_str = "-.---";
+        }
+        
+        # Format: "● fieldname: 123.4"
+        # 1 (glyph) + 1 (space) + length(name) + 2 (": ") + length(value)
+        my $line_width = 1 + 1 + length($name) + 2 + length($value_str);
+        $max_width = $line_width if $line_width > $max_width;
+    }
+    
+    # Add some padding and ensure minimum width
+    my $width = $max_width + 2;
+    return $width < 16 ? 16 : $width;
+}
 
 sub recompute_layout {
     ($ROWS,$COLS) = term_size();
@@ -101,12 +264,19 @@ sub recompute_layout {
     $plot_height = $plot_bottom - $plot_top + 1;
 
     $plot_left   = $yaxis_w + $pad_left + 1;      # 1-based columns
-    my $legend_w = 14;                             # keep right-side legend gutter fixed, independent of N
-    $plot_right  = $COLS - $pad_right - $legend_w;
+    $legend_width = calculate_legend_width();     # dynamic width calculation
+    $plot_right  = $COLS - $pad_right - $legend_width - 5;
     $plot_right  = $plot_left if $plot_right < $plot_left;
     $plot_width  = $plot_right - $plot_left + 1;
 
     $legend_col_start = $plot_right + 2;          # legend gutter start column
+    
+    # Check if legend width changed and trigger redraw if needed
+    if ($legend_width != $last_legend_width) {
+        $need_redraw = 1;
+        print STDERR "Legend width changed: $last_legend_width -> $legend_width\n" if $last_legend_width > 0;
+        $last_legend_width = $legend_width;
+    }
 }
 
 # Map value -> column within [plot_left, plot_right]
@@ -125,7 +295,9 @@ sub draw_header {
     my $barbg = 238;
     for my $r (1..$opt{header}) {
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
-        my $label = $r==1 ? " Fixed Header — Vertical Scroll Region Test (tmux-256color) " : "";
+        my $mode = $opt{demo_mode} ? "DEMO" : "SERIAL";
+        my $port_info = $opt{demo_mode} ? "" : " ($opt{serial_port}\@$opt{baud_rate})";
+        my $label = $r==1 ? " Serial Data Plotter [$mode]$port_info " : "";
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         $line = substr($line, 0, $COLS-1);
         print $line, reset_attrs_str(), clr_eol();
@@ -139,7 +311,7 @@ sub draw_footer {
         my $r = $ROWS - $opt{footer} + 1 + $i;
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
         my $label = $i==0
-          ? " Footer — q=quit  N=toggle per-glyph field numbers  (resize to test SIGWINCH) "
+          ? " Footer — q=quit  N=toggle field numbers  (Fields: $S, Legend: ${legend_width}ch) "
           : "";
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         $line = substr($line, 0, $COLS-1);
@@ -147,17 +319,48 @@ sub draw_footer {
     }
 }
 
-# Legend gutter (right side), only small static info (numbers) so the plot row stays “just chars”
+# Vertical legend gutter (right side)
 sub draw_legend_gutter {
-    my $r = $opt{header} > 0 ? 1 : $plot_top;
+    my $start_row = $plot_top;
     my $c = $legend_col_start;
-    my $s = " Fields: ";
+    
+    # Clear the legend area first
+    for my $r ($start_row..$plot_bottom) {
+        print gotorc($r, $c), clr_eol();
+    }
+    
+    # Draw fields vertically
     for my $i (0..$S-1) {
+        my $r = $start_row + $i;
+        last if $r > $plot_bottom;  # Don't overflow the plot area
+        
         my $g = $glyphs[$i % @glyphs];
         my $color = $colors[$i % @colors];
-        $s .= fg256($color) . $g . reset_attrs_str() . sprintf("%d ", $i+1);
+        my $name = $field_names[$i] // ($i + 1);
+        
+        my $value_str;
+        if (defined $values[$i]) {
+            # Format numbers based on magnitude for better display
+            my $val = $values[$i];
+            if (abs($val) >= 1000) {
+                $value_str = sprintf("%.0f", $val);
+            } elsif (abs($val) >= 100) {
+                $value_str = sprintf("%.1f", $val);
+            } elsif (abs($val) >= 10) {
+                $value_str = sprintf("%.2f", $val);
+            } else {
+                $value_str = sprintf("%.3f", $val);
+            }
+        } else {
+            $value_str = "-.---";
+        }
+        
+        my $line = sprintf("%s%s%s %s: %s", 
+            fg256($color), $g, reset_attrs_str(), 
+            $name, $value_str);
+        
+        print gotorc($r, $c), $line;
     }
-    print gotorc($r,$c), $s, clr_eol();
 }
 
 # ---------------- Render scaffolding ----------------
@@ -183,13 +386,15 @@ sub restore_tty {
 }
 
 # ---------------- Data update ----------------
-sub step_series {
+sub step_series_demo {
     for my $i (0..$S-1) {
         my $step = (rand() - 0.5) * $vol[$i];
         $values[$i] += $step;
         push @{$hist[$i]}, $values[$i];
         shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
     }
+    # Check if legend width needs to change
+    recompute_layout();
 }
 
 sub window_minmax {
@@ -208,6 +413,8 @@ sub window_minmax {
 # Build one row string containing all series glyphs at mapped columns
 sub build_plot_row {
     my ($vmin, $vmax) = @_;
+    return "" if $S == 0;  # No data yet
+    
     my $width = $plot_width;
     my @buf = (' ') x $COLS;
 
@@ -243,10 +450,7 @@ sub build_plot_row {
         $buf[$plot_right] = fg256($border_col) . '│' . reset_attrs_str();
     }
 
-    # If legend_on, refresh a compact legend number at the far right of this row? No—keep rows “just chars”.
-    # Legend lives in header/right gutter; rows are pure glyphs.
-
-    # Return the visible line covering the whole width (avoid trailing control sequences mid-line)
+    # Return the visible line covering the whole width
     return join('', @buf[0..$COLS-1]);
 }
 
@@ -261,6 +465,7 @@ sub cleanup {
     reset_scroll_region();
     show_cursor();
     print gotorc($ROWS,1), "\n";
+    close($serial_fh) if $serial_fh;
     $cleaned = 1;
 }
 
@@ -275,6 +480,18 @@ $SIG{INT}  = sub { cleanup(); restore_tty(); exit 130 };
 $SIG{TERM} = sub { cleanup(); restore_tty(); exit 143 };
 $SIG{__DIE__} = sub { cleanup(); restore_tty(); die @_ };
 
+# Initialize data and serial
+init_data();
+unless ($opt{demo_mode}) {
+    eval { open_serial_port(); };
+    if ($@) {
+        print STDERR "Warning: Could not open serial port: $@";
+        print STDERR "Falling back to demo mode\n";
+        $opt{demo_mode} = 1;
+        init_data();
+    }
+}
+
 # Initial layout & draw
 recompute_layout();
 full_redraw();
@@ -283,6 +500,7 @@ set_raw_tty();
 # Nonblocking input + main loop
 require Time::HiRes;
 my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
+$sleep_s = 0.1 if $sleep_s == 0;  # Default to 100ms for serial reading
 
 while (1) {
     my $ch = '';
@@ -299,16 +517,38 @@ while (1) {
         $need_redraw = 0;
     }
 
-    # Advance data
-    step_series();
-    my ($vmin,$vmax) = window_minmax();
+    # Read and process data
+    my $data_updated = 0;
+    if ($opt{demo_mode}) {
+        step_series_demo();
+        $data_updated = 1;
+    } else {
+        my @lines = read_serial_data();
+        for my $line (@lines) {
+            next if $line =~ /^\s*$/;  # Skip empty lines
+            my ($names, $values) = parse_arduino_line($line);
+            if (@$names > 0) {
+                update_fields($names, $values);
+                $data_updated = 1;
+                last;  # Use the last valid line in this batch
+            }
+        }
+    }
 
-    # Build one row and print it at bottom of scroll region; newline triggers vertical scroll inside region
-    my $row = build_plot_row($vmin,$vmax);
-    print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
+    # Only plot if we have data and it was updated
+    if ($data_updated && $S > 0) {
+        my ($vmin,$vmax) = window_minmax();
 
-    # Keep cursor at bottom inside region so LF scrolls only within region
-    print gotorc($plot_bottom, 1);
+        # Build one row and print it at bottom of scroll region
+        my $row = build_plot_row($vmin,$vmax);
+        print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
+
+        # Keep cursor at bottom inside region so LF scrolls only within region
+        print gotorc($plot_bottom, 1);
+        
+        # Update legend with current values
+        draw_legend_gutter();
+    }
 
     Time::HiRes::sleep($sleep_s) if $sleep_s > 0;
 }
