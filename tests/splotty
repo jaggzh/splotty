@@ -66,6 +66,8 @@ my ($ROWS, $COLS) = term_size();
 my $need_redraw = 1;     # trigger full redraw
 my $inline_nums_on = 1;  # toggle with 'N' to show/hide per-glyph sensor numbers
 my $min_plot_height = 6;
+my $debug_msg = "";      # debug message for footer
+my $legend_update_counter = 0;  # counter for legend updates
 
 # gutters
 my $yaxis_w   = 0;       # pure char plotting; no X/Y axes in the scroller row lines
@@ -95,7 +97,7 @@ sub open_serial_port {
     my $flags = fcntl($serial_fh, F_GETFL, 0) or die "fcntl F_GETFL: $!\n";
     fcntl($serial_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL: $!\n";
     
-    print STDERR "Opened serial port $port at $baud baud\n";
+    $debug_msg = "Opened $port at $baud baud";
 }
 
 sub read_serial_data {
@@ -193,7 +195,7 @@ sub update_fields {
         @values = @$new_values;
         @hist = map { [] } (0..$S-1);
         $need_redraw = 1;
-        print STDERR "Field structure changed: " . join(", ", @field_names) . "\n";
+        $debug_msg = "Fields changed: " . join(", ", @field_names);
     } else {
         # Update values
         @values = @$new_values;
@@ -279,8 +281,7 @@ sub recompute_layout {
     # Check if legend width changed and trigger redraw if needed
     if ($legend_width != $last_legend_width) {
         $need_redraw = 1;
-        print STDERR "Legend width changed: $last_legend_width -> $legend_width\n" if $last_legend_width > 0;
-        print STDERR "Layout: plot_left=$plot_left, plot_right=$plot_right, legend_start=$legend_col_start, COLS=$COLS\n";
+        $debug_msg = "Legend: $last_legend_width -> $legend_width, plot: $plot_left-$plot_right, legend: $legend_col_start" if $last_legend_width > 0;
         $last_legend_width = $legend_width;
     }
 }
@@ -317,9 +318,12 @@ sub draw_footer {
         my $r = $ROWS - $opt{footer} + 1 + $i;
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
         my $gap = $legend_col_start - $plot_right - 1;
-        my $label = $i==0
-          ? " Footer — q=quit  N=toggle field numbers  (Fields: $S, Legend: ${legend_width}ch, Gap: $gap) "
-          : "";
+        my $label = "";
+        if ($i == 0) {
+            $label = " Footer — q=quit  N=toggle field numbers  (Fields: $S, Legend: ${legend_width}ch, Gap: $gap) ";
+        } elsif ($i == 1 && $debug_msg) {
+            $label = " DEBUG: $debug_msg ";
+        }
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         $line = substr($line, 0, $COLS-1);
         print $line, reset_attrs_str(), clr_eol();
@@ -330,9 +334,12 @@ sub draw_footer {
 sub draw_legend_gutter {
     my $start_row = $plot_top;
     my $c = $legend_col_start;
+    my $max_legend_rows = $S;  # Only clear what we need
     
-    # Clear the legend area first
-    for my $r ($start_row..$plot_bottom) {
+    # Clear only the legend area we're actually using
+    for my $i (0..$max_legend_rows) {
+        my $r = $start_row + $i;
+        last if $r > $plot_bottom;
         print gotorc($r, $c), clr_eol();
     }
     
@@ -375,9 +382,18 @@ sub clear_screen { print esc("2J") }
 
 sub full_redraw {
     reset_scroll_region();
-    clear_screen();
+    # Don't clear entire screen - preserve plot data
+    # clear_screen();
+    
+    # Clear and redraw only the fixed areas
     draw_header();
     draw_footer();
+    
+    # Clear the legend area explicitly
+    for my $r ($plot_top..$plot_bottom) {
+        print gotorc($r, $legend_col_start), clr_eol();
+    }
+    
     set_scroll_region($plot_top, $plot_bottom);
     # place cursor at bottom of region so printing a line will scroll up
     print gotorc($plot_bottom, 1);
@@ -495,8 +511,7 @@ init_data();
 unless ($opt{demo_mode}) {
     eval { open_serial_port(); };
     if ($@) {
-        print STDERR "Warning: Could not open serial port: $@";
-        print STDERR "Falling back to demo mode\n";
+        $debug_msg = "Serial failed, using demo mode: $@";
         $opt{demo_mode} = 1;
         init_data();
     }
@@ -504,6 +519,8 @@ unless ($opt{demo_mode}) {
 
 # Initial layout & draw
 recompute_layout();
+# Clear screen once at startup
+clear_screen();
 full_redraw();
 set_raw_tty();
 
@@ -556,8 +573,12 @@ while (1) {
         # Keep cursor at bottom inside region so LF scrolls only within region
         print gotorc($plot_bottom, 1);
         
-        # Update legend with current values
-        draw_legend_gutter();
+        # Update legend periodically to avoid interference with scrolling
+        $legend_update_counter++;
+        my $update_legend = $need_redraw || ($legend_update_counter % 10 == 0);  # Every 10th update
+        if ($update_legend) {
+            draw_legend_gutter();
+        }
     }
 
     Time::HiRes::sleep($sleep_s) if $sleep_s > 0;
