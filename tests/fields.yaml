@@ -1,0 +1,36 @@
+groups:
+  1:
+      key: 1
+  2:
+      - key: 2
+  raw:
+      - key: "r"
+  btn:
+      - key: "b"
+
+fields:
+  - "d1.Zraw":
+    - "groups":
+      - [1, "raw"] # d1.Zraw is in groups 1 and 'raw'
+  - "d2.Zraw":
+    - "groups":
+      - [2, "raw"]
+  
+# All fields I have to classify:
+d1.Zsmooth
+d1.min
+d1.max
+d1.TrigH
+d1.TrigL
+d1.btn
+d1.chg_rate
+d1.humanPct
+d2.Zraw
+d2.Zsmooth
+d2.min
+d2.max
+d2.TrigH
+d2.TrigL
+d2.btn
+d2.chg_rate
+d2.humanPct
