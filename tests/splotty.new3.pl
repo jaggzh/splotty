@@ -1,3 +1,121 @@
+#!/usr/bin/perl
+#!/usr/bin/perl -d
+# keep -d for forced debug on
+# splotty: Serial-data Text-based Plotter
+BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
+use v5.36;
+use utf8;
+use Getopt::Long;
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use FindBin;
+use lib "$FindBin::RealBin/lib";
+use String::ShortcutsAuto qw(assign_shortcuts);
+use YAML::XS qw(LoadFile DumpFile);
+use File::HomeDir;
+use File::Path qw(make_path);
+use File::Spec;
+use Cwd 'abs_path';
+use Data::Dumper;
+binmode STDOUT, ':encoding(UTF-8)';
+
+# ---------------- CLI ----------------
+my %opt = (
+    header   => 2,     # minimum header lines; will be dynamic
+    footer   => 1,     # minimum footer lines; will be calculated
+    series   => 4,     # how many fields (series) - will be dynamic with serial
+    window   => 30,    # autorange window (rows) across all series
+    delay_ms => 0,     # inter-row delay in ms; default off (0)
+    no_color => 0,     # disable color
+    serial_port => '/dev/ttyACM1',  # default serial port
+    baud_rate => 115200,            # default baud rate
+    demo_mode => 0,                 # use fake data instead of serial
+    fieldspec => '',                # fieldspec YAML file
+    wipe      => 0,                 # wipe our stored fieldspec path
+    force     => 0,                 # force run, ignoring fieldspec path
+    help => 0,                      # show help
+);
+
+sub show_help {
+    print <<'EOF';
+splotty: Serial-data Text-based Plotter
+
+USAGE:
+    splotty [OPTIONS]
+
+OPTIONS:
+    --header=N          Minimum header lines (default: 2)
+    --footer=N          Minimum footer lines (calculated dynamically)
+    --series=N          Initial number of series (default: 4, auto-detected)
+    --window=N          Autorange window in rows (default: 30)
+    --delay_ms=N        Inter-row delay in milliseconds (default: 0)
+    --no-color          Disable color output
+    --serial-port=PATH  Serial port path (default: /dev/ttyACM1)
+    --baud-rate=N       Baud rate (default: 115200)
+    --demo              Use demo mode with fake data
+    --fieldspec=FILE    Load field specification YAML file
+    -f FILE             Short form of --fieldspec
+    --wipe              Wipe stored fieldspec path
+    --force             Force run, ignoring a bad fieldspec path
+    --help              Show this help
+
+CONTROLS (in plotter):
+    q                   Quit
+    N                   Toggle inline numbers on plot points
+    ^T                  Toggle terminal input mode (send data to serial)
+    ^D                  Toggle raw serial output window
+    +/-                 Resize raw output window (when active)
+    [field keys]        Toggle individual fields (defined in fieldspec)
+    [group keys]        Toggle field groups (defined in fieldspec)
+
+FIELDSPEC FORMAT:
+    YAML file defining groups, fields, colors, and keyboard shortcuts.
+    See example fields.yaml for format details.
+
+EXAMPLES:
+    splotty --demo                          # Demo mode
+    splotty -f fields.yaml                  # Load field configuration
+    splotty --serial-port=/dev/ttyUSB0      # Different serial port
+    splotty -f fields.yaml --demo           # Demo with field config
+EOF
+    exit 0;
+}
+
+GetOptions(
+    'header=i'      => \$opt{header},
+    'footer=i'      => \$opt{footer},
+    'series=i'      => \$opt{series},
+    'window=i'      => \$opt{window},
+    'delay_ms|d=i'  => \$opt{delay_ms},
+    'no-color!'     => \$opt{no_color},
+    'serial-port=s' => \$opt{serial_port},
+    'baud-rate=i'   => \$opt{baud_rate},
+    'demo!'         => \$opt{demo_mode},
+    'fieldspec|f=s' => \$opt{fieldspec},
+    'wipe'          => \$opt{wipe},
+    'force'         => \$opt{force},
+    'help|h'        => \$opt{help},
+) or die "Bad options. Use --help for usage information.\n";
+
+show_help() if $opt{help};
+
+# ---------------- Configuration & State Management ----------------
+my $config_dir = File::Spec->catdir(File::HomeDir->my_home, '.config', 'splotty');
+my $state_file = File::Spec->catfile($config_dir, 'state.yaml');
+
+my %fieldspec = ();          # Loaded fieldspec configuration
+my %group_states = ();       # Current group on/off states
+my %field_states = ();       # Current field on/off states
+my %field_shortcuts = ();    # Field name -> keyboard shortcut
+my %group_shortcuts = ();    # Group name -> keyboard shortcut
+my %shortcut_to_field = ();  # Reverse mapping: shortcut -> field name
+my %shortcut_to_group = ();  # Reverse mapping: shortcut -> group name
+my $fieldspec_path = '';     # Resolved path to current fieldspec
+
+sub get_config_dir {
+    make_path($config_dir) unless -d $config_dir;
+    return $config_dir;
+}
+
 sub load_state {
     return unless -f $state_file;
     
@@ -215,6 +333,23 @@ sub assign_auto_shortcuts {
     }
 }
 
+sub toggle_group {
+    my ($group_name) = @_;
+    return unless exists $group_states{$group_name};
+    
+    $group_states{$group_name} = !$group_states{$group_name};
+    apply_group_states_to_fields();
+    set_debug("Toggled group '$group_name' to " . ($group_states{$group_name} ? 'ON' : 'OFF'));
+}
+
+sub toggle_field {
+    my ($field_name) = @_;
+    return unless exists $field_states{$field_name};
+    
+    $field_states{$field_name} = !$field_states{$field_name};
+    set_debug("Toggled field '$field_name' to " . ($field_states{$field_name} ? 'ON' : 'OFF'));
+}
+
 sub is_field_enabled {
     my ($field_name) = @_;
     return $field_states{$field_name} // 1;
@@ -229,6 +364,161 @@ sub is_field_hidden {
 sub get_field_config {
     my ($field_name) = @_;
     return $fieldspec{fields}->{$field_name} // {};
+}
+
+# ---------------- Term & ANSI helpers ----------------
+my $cur_area = '';
+my $cur_plot_top;
+
+sub esc  { "\e[" . shift }
+sub gotorc { my ($r,$c)=@_; sprintf "\e[%d;%dH",$r,$c }
+sub clr_eol { esc("K") }
+sub hide_cursor { print esc("?25l") }
+sub show_cursor { print esc("?25h") }
+sub set_scroll_region { my ($top,$bot)=@_; print esc("${top};${bot}r") }
+sub reset_scroll_region { print esc("r"); $cur_area = ''; }
+sub a_rst { esc("0m") }
+sub fg256 { my ($n)=@_; $opt{no_color} ? "" : esc("38;5;${n}m") }
+sub bg256 { my ($n)=@_; $opt{no_color} ? "" : esc("48;5;${n}m") }
+sub fg24 { my ($r,$g,$b)=@_; $opt{no_color} ? "" : esc("38;2;${r};${g};${b}m") }
+sub bg24 { my ($r,$g,$b)=@_; $opt{no_color} ? "" : esc("48;2;${r};${g};${b}m") }
+sub bold { $opt{no_color} ? "" : esc("1m") }
+sub a_raw_area { bg256(17) }
+
+# Color definitions for field name highlighting
+sub a_fieldname { fg256(253); }  # Normal field name color
+sub a_fieldname_disabled { $opt{no_color} ? "" : fg256(240) }  # Dimmed for disabled fields
+sub a_hotkey { $opt{no_color} ? "" : fg256(226) . bold() }  # Bright yellow for hotkey
+sub a_warn { esc("33;1m") }
+my $a_header_bg = bg256(237);
+my $a_footer_bg = bg256(236);
+my $a_legend_bg = bg256(17);
+
+sub swarn {
+    print STDERR a_warn(), @_, a_rst();
+}
+sub ds {
+    print Dumper(shift);
+}
+
+sub term_size {
+    my ($rows,$cols) = (undef, undef);
+    eval {
+        require "sys/ioctl.ph";            ## no critic
+        my $winsize = pack('S4', 0,0,0,0);
+        ioctl(STDOUT, &TIOCGWINSZ, $winsize) or die;
+        ($rows,$cols) = unpack('S4', $winsize);
+        1;
+    } or do {
+        my $sz = `stty size 2>/dev/null`;
+        ($rows,$cols) = ($1,$2) if $sz =~ /(\d+)\s+(\d+)/;
+    };
+    $rows ||= 24; $cols ||= 80;
+    return ($rows,$cols);
+}
+
+# ---------------- Layout state ----------------
+my ($ROWS, $COLS) = term_size();
+my $need_redraw = 1;     # trigger full redraw
+my $inline_nums_on = 0;  # toggle with 'N' to show/hide per-glyph sensor numbers
+my $min_plot_height = 6;
+my $debug_msg = "";      # debug message for footer
+my $input_active = 0;    # whether terminal input line is active
+my $input_buffer = "";   # current input buffer
+my $input_cursor = 0;    # cursor position in input buffer
+
+# Layout calculations
+my ($actual_header_lines, $actual_footer_lines, $legend_lines_needed);
+my ($plot_top, $plot_bottom, $plot_height, $plot_left, $plot_right, $plot_width);
+my ($legend_start_row);
+my $raw_output_active = 0;  # whether raw serial output area is active
+my $raw_output_height = 0;  # height of raw output area
+my $raw_output_top = 0;     # top row of raw output area
+my $raw_output_bottom = 0;  # bottom row of raw output area
+my @plot_data_buffer = ();  # buffer plot data when raw output is active
+
+# gutters
+my $yaxis_w   = 0;       # pure char plotting; no X/Y axes in the scroller row lines
+my $pad_left  = 1;       # small left pad
+my $pad_right = 1;       # small right pad
+
+# glyphs/colors
+my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
+my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
+
+# ---------------- Data ----------------
+my $S = $opt{series};
+my @values;          # current values (length S)
+my @field_names;     # field names for each series
+my @hist;            # history ring buffers per series (array of arrayrefs)
+my $hsize = $opt{window};
+
+# For demo mode - keep the original random data
+my @start = map { 50 + rand()*50 } (1..$S);
+my @vol   = map { 6 + rand()*6 }   (1..$S);
+
+# ---------------- Field Stability System ----------------
+my %field_configs;       # track different field configurations
+my $current_config_key = "";
+my $config_stability_count = 0;
+my $min_stability_count = 3;  # need to see config this many times before changing
+my $max_recent_configs = 10;   # keep track of recent configs
+
+sub get_config_key {
+    my ($names) = @_;
+    return join('|', @$names);
+}
+
+sub update_field_stability {
+    my ($new_names, $new_values) = @_;
+    
+    my $config_key = get_config_key($new_names);
+    
+    # Track this configuration
+    $field_configs{$config_key}++;
+    
+    # Clean up old configs if we have too many
+    if (keys %field_configs > $max_recent_configs) {
+        # Remove configs with lowest counts
+        my @sorted_configs = sort { $field_configs{$a} <=> $field_configs{$b} } keys %field_configs;
+        while (keys %field_configs > $max_recent_configs) {
+            my $to_remove = shift @sorted_configs;
+            delete $field_configs{$to_remove};
+        }
+    }
+    
+    # Check if this is the same as current config
+    if ($config_key eq $current_config_key) {
+        $config_stability_count++;
+    } else {
+        # Different config - check if it has enough stability
+        if ($field_configs{$config_key} >= $min_stability_count) {
+            # This config is stable enough, switch to it
+            $current_config_key = $config_key;
+            $config_stability_count = $field_configs{$config_key};
+            
+            # Actually update the fields
+            @field_names = @$new_names;
+            $S = @field_names;
+            @values = @$new_values;
+            @hist = map { [] } (0..$S-1);
+            $need_redraw = 1;
+            set_debug("Fields changed to: " . join(", ", @field_names) . " (stability: $config_stability_count)");
+            return 1;  # indicate change happened
+        } else {
+            # Not stable enough yet, keep current config but update debug
+            set_debug("New config seen: " . join(", ", @$new_names) . " (count: " . $field_configs{$config_key} . "/$min_stability_count)");
+            return 0;  # no change
+        }
+    }
+    
+    # Same config, just update values
+    if (@field_names > 0) {  # only if we have established fields
+        @values = @$new_values;
+        return 1;  # indicate data was updated
+    }
+    
+    return 0;
 }
 
 # Calculate how many lines we need for legend
@@ -269,33 +559,314 @@ sub calculate_legend_lines_needed {
     return $lines;
 }
 
-# Color definitions for field name highlighting
-sub a_fieldname { reset_attrs_str() }  # Normal field name color
-sub a_fieldname_disabled { $opt{no_color} ? "" : fg256(240) }  # Dimmed for disabled fields
-sub a_hotkey { $opt{no_color} ? "" : fg256(226) . bold() }  # Bright yellow for hotkey
-sub a_rst { reset_attrs_str() }  # Reset
-sub a_warn { esc("33;1m") }
+# Calculate footer lines needed
+sub calculate_footer_lines_needed {
+    my $lines = 1;  # Always need at least one line for controls
+    
+    # Add line for debug message if present
+    $lines++ if $debug_msg;
+    
+    return $lines;
+}
+
+# ---------------- Serial Data ----------------
+my $serial_fh;
+my $serial_buffer = '';
+
+sub open_serial_port {
+    my $port = $opt{serial_port};
+    my $baud = $opt{baud_rate};
+    
+    # Configure the serial port using stty
+    system("stty -F $port $baud cs8 -cstopb -parity raw -echo") == 0
+        or die "Failed to configure serial port $port: $!\n";
+    
+    # Open the serial port
+    open($serial_fh, '+<', $port) or die "Cannot open serial port $port: $!\n";
+    
+    # Make it non-blocking
+    my $flags = fcntl($serial_fh, F_GETFL, 0) or die "fcntl F_GETFL: $!\n";
+    fcntl($serial_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL: $!\n";
+    
+    set_debug("Opened $port at $baud baud");
+}
+
+sub read_serial_data {
+    return unless $serial_fh;
+    
+    my $data;
+    my $bytes_read = sysread($serial_fh, $data, 1024);
+    return unless defined $bytes_read && $bytes_read > 0;
+    
+    $serial_buffer .= $data;
+    
+    my @lines;
+    while ($serial_buffer =~ s/^([^\n]*)\n//) {
+        my $line = $1;
+        $line =~ s/\r//g;  # remove carriage returns
+        push @lines, $line;
+    }
+    
+    return @lines;
+}
+
+sub send_serial_data {
+    my ($data) = @_;
+    return unless $serial_fh;
+    
+    # Add newline if not present
+    $data .= "\n" unless $data =~ /\n$/;
+    
+    eval {
+        print $serial_fh $data;
+        $serial_fh->flush() if $serial_fh->can('flush');
+    };
+    
+    if ($@) {
+        set_debug("Send error: $@");
+    } else {
+        set_debug("Sent: " . substr($data, 0, 40) . (length($data) > 40 ? "..." : ""));
+    }
+}
+
+sub output_raw_line {
+    my ($line) = @_;
+    
+    # Convert tabs to two spaces
+    $line =~ s/\t/  /g;
+    
+    setup_raw_output_scroll();
+    print gotorc($raw_output_bottom, 1);
+    $line =~ s/\n$//;
+    print a_raw_area() . "\n" . $line . a_rst();
+}
+
+sub clear_raw_output_area {
+    return unless $raw_output_active;
+    
+    for my $r ($raw_output_top..$raw_output_bottom) {
+        print gotorc($r, 1), a_raw_area() . clr_eol() . a_rst();
+    }
+}
+
+sub setup_raw_output_scroll {
+    if ($raw_output_active) {
+        if ($cur_area ne 'raw') {
+            set_scroll_region($raw_output_top, $raw_output_bottom);
+        }
+        $cur_area = 'raw';
+    }
+}
+
+sub setup_plot_output_scroll {
+    if ($cur_area ne 'plot') {
+        set_scroll_region($cur_plot_top, $plot_bottom);
+        $cur_area = 'plot';
+    }
+}
+
+sub init_data {
+    if ($opt{demo_mode}) {
+        # Initialize demo data
+        @field_names = map { "field$_" } (1..$S);
+        $current_config_key = get_config_key(\@field_names);
+        $config_stability_count = $min_stability_count;
+        for my $i (0..$S-1) {
+            $values[$i] = $start[$i];
+            $hist[$i]   = [];
+        }
+    } else {
+        # Initialize empty for serial data
+        @values = ();
+        @field_names = ();
+        @hist = ();
+        $S = 0;
+        $current_config_key = "";
+        $config_stability_count = 0;
+    }
+}
+
+sub parse_arduino_line {
+    my ($line) = @_;
+    chomp $line;
+    $line =~ s/\s+$//;  # strip trailing whitespace
+    
+    my @fields = split /\t/, $line;
+    my (@names, @vals);
+    
+    for my $i (0..$#fields) {
+        my $field = $fields[$i];
+        if ($field =~ /^([^: ]+):([+-]?(?:\d+\.?\d*|\.\d+))$/) {
+            # Has label: "label:value"
+            push @names, $1;
+            push @vals, $2 + 0;  # convert to number
+        } elsif ($field =~ /^([+-]?(?:\d+\.?\d*|\.\d+))$/) {
+            # No label, just value: "value"
+            push @names, ($i + 1);  # 1-indexed field number
+            push @vals, $1 + 0;
+        } else {
+            return ([],[]); # Return nothing on any invalid data
+        }
+    }
+    
+    return (\@names, \@vals);
+}
+
+sub update_fields {
+    my ($new_names, $new_values) = @_;
+    
+    my $data_updated = update_field_stability($new_names, $new_values);
+    
+    if ($data_updated && @field_names > 0) {
+        # Update history
+        for my $i (0..$S-1) {
+            push @{$hist[$i]}, $values[$i];
+            shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
+        }
+        
+        # Recompute layout
+        recompute_layout();
+    }
+    
+    return $data_updated;
+}
+
+sub recompute_layout {
+    ($ROWS,$COLS) = term_size();
+    
+    # Calculate dynamic layout requirements
+    $legend_lines_needed = calculate_legend_lines_needed();
+    $actual_footer_lines = calculate_footer_lines_needed();
+    $actual_header_lines = $input_active ? 3 : 2;  # Extra line when input is active
+    
+    # Reserve space for header, footer, and legend
+    my $avail = $ROWS - $actual_header_lines - $actual_footer_lines - $legend_lines_needed;
+    if ($avail < $min_plot_height) {
+        # Reduce legend space if needed
+        my $min_legend = 1;
+        $legend_lines_needed = $min_legend if $legend_lines_needed > $min_legend;
+        $avail = $ROWS - $actual_header_lines - $actual_footer_lines - $legend_lines_needed;
+        
+        # Reduce header if still not enough space
+        if ($avail < $min_plot_height && !$input_active) {
+            $actual_header_lines = 1;
+            $avail = $ROWS - $actual_header_lines - $actual_footer_lines - $legend_lines_needed;
+        }
+        
+        die "Not enough vertical space (rows=$ROWS)\n" if $avail < $min_plot_height;
+    }
+    
+    $plot_top = $actual_header_lines + 1;
+    $legend_start_row = $ROWS - $actual_footer_lines - $legend_lines_needed + 1;
+    
+    if ($raw_output_active) {
+        # Split available space between plot and raw output
+        if ($raw_output_height == 0) {
+            # First time opening - use half the available space
+            $raw_output_height = int($avail / 2);
+            $raw_output_height = 3 if $raw_output_height < 3;  # minimum height
+        }
+        
+        # Ensure raw output doesn't exceed available space
+        my $max_raw_height = $avail - 3;  # leave at least 3 lines for plot
+        $raw_output_height = $max_raw_height if $raw_output_height > $max_raw_height;
+        $raw_output_height = 3 if $raw_output_height < 3;
+        
+        $raw_output_top = $plot_top;
+        $raw_output_bottom = $raw_output_top + $raw_output_height - 1;
+        $cur_plot_top = $raw_output_bottom + 1;
+    } else {
+        $cur_plot_top = $plot_top;
+    }
+    
+    $plot_bottom = $legend_start_row - 1;
+    $plot_height = $plot_bottom - $plot_top + 1;
+    $plot_left = $yaxis_w + $pad_left + 1;      # 1-based columns
+    $plot_right = $COLS - $pad_right;
+    $plot_right = $plot_left if $plot_right < $plot_left;
+    $plot_width = $plot_right - $plot_left + 1;
+}
+
+# Map value -> column within [plot_left, plot_right]
+sub val_to_col {
+    my ($v, $vmin, $vmax) = @_;
+    return $plot_left if $plot_width <= 1;
+    my $t = ($v - $vmin) / (($vmax-$vmin) || 1e-9);
+    $t = 0 if $t < 0; $t = 1 if $t > 1;
+    my $x = int($t * ($plot_width-1));
+    return $plot_left + $x;
+}
+
+# ---------------- Draw fixed bars ----------------
+sub draw_header {
+    my $barbg = $a_header_bg;
+    
+    # Row 1: Title and info
+    print gotorc(1,1), $barbg, fg256(231), bold();
+    my $mode = $opt{demo_mode} ? "DEMO" : "SERIAL";
+    my $port_info = $opt{demo_mode} ? "" : " ($opt{serial_port}\@$opt{baud_rate})";
+    my $fieldspec_info = $fieldspec_path ? " [" . (split('/', $fieldspec_path))[-1] . "]" : "";
+    my $label = " Serial Data Plotter [$mode]$port_info$fieldspec_info ";
+    $label = substr($label, 0, $COLS-1) if length($label) > $COLS-1;
+    print $label, " " x ($COLS - 1 - length($label)), a_rst(), clr_eol();
+    
+    # Row 2: Input line (when active) or empty
+    print gotorc(2,1), $barbg, fg256(231);
+    if ($input_active) {
+        my $prompt = " Send> ";
+        my $available_width = $COLS - 1 - length($prompt);
+        my $display_buffer = $input_buffer;
+        my $display_cursor = $input_cursor;
+        
+        # Handle scrolling if input is too long
+        if (length($display_buffer) > $available_width) {
+            my $start_pos = $input_cursor - int($available_width * 0.8);
+            $start_pos = 0 if $start_pos < 0;
+            $display_buffer = substr($input_buffer, $start_pos, $available_width);
+            $display_cursor = $input_cursor - $start_pos;
+        }
+        
+        my $line = $prompt . $display_buffer;
+        # Pad to full width
+        $line .= " " x ($COLS - 1 - length($line)) if length($line) < $COLS - 1;
+        print $line, a_rst();
+        
+        # Position cursor
+        my $cursor_col = length($prompt) + $display_cursor + 1;
+        print gotorc(2, $cursor_col);
+        return;  # Don't clear EOL to preserve cursor position
+    } else {
+        # Empty line when input not active
+        print " " x ($COLS - 1), a_rst(), clr_eol();
+    }
+    
+    # Row 3: Empty (only when input is active)
+    if ($input_active) {
+        print gotorc(3,1), $barbg, fg256(231);
+        print " " x ($COLS - 1), a_rst(), clr_eol();
+    }
+}
 
 sub highlight_field_name {
     my ($field_name, $shortcut, $is_enabled) = @_;
     
     my $base_color = $is_enabled ? a_fieldname() : a_fieldname_disabled();
-    return $base_color . $field_name . a_rst() unless $shortcut;
+    return $base_color . $field_name  unless $shortcut;
     
     # Highlight the shortcut character in the field name
     my $highlighted_name = $field_name;
-    if ($highlighted_name =~ s/(\Q$shortcut\E)/x${a_hotkey()}$1${base_color}z/i) {
-        return $base_color . $highlighted_name . a_rst();
+    if ($highlighted_name =~ s/(\Q$shortcut\E)/a_hotkey() . $1 .${base_color}/ei) {
+        return $base_color . $highlighted_name;
     } else {
         # If shortcut not found in name, just append it
-        return $base_color . $field_name . a_rst() . "(" . a_hotkey() . $shortcut . a_rst() . ")";
+        return $base_color . $field_name . "(" . a_hotkey() . $shortcut . a_fieldname() . ")";
     }
 }
 
 sub draw_legend {
     return if $legend_lines_needed <= 0 || $S == 0;
     
-    my $barbg = 236;  # Slightly different background for legend
+    my $barbg = $a_legend_bg;
     
     # Get non-hidden fields for display (both enabled and disabled)
     my @display_fields;
@@ -308,16 +879,16 @@ sub draw_legend {
     # Handle case where no fields are available for display
     if (@display_fields == 0) {
         my $r = $legend_start_row;
-        print gotorc($r, 1), bg256($barbg), fg256(231);
+        print gotorc($r, 1), $barbg, fg256(231);
         my $msg = " No fields to display ";
         my $line = $msg . " " x ($COLS - 1 - length($msg));
-        print $line, reset_attrs_str(), clr_eol();
+        print $line, a_rst(), clr_eol();
         
         # Clear remaining legend lines
         for my $remaining_line (1..$legend_lines_needed-1) {
             my $clear_r = $legend_start_row + $remaining_line;
-            print gotorc($clear_r, 1), bg256($barbg), fg256(231);
-            print " " x ($COLS - 1), reset_attrs_str(), clr_eol();
+            print gotorc($clear_r, 1), $barbg, fg256(231);
+            print " " x ($COLS - 1), a_rst(), clr_eol();
         }
         return;
     }
@@ -352,7 +923,8 @@ sub draw_legend {
         my $highlighted_name = highlight_field_name($field_name, $shortcut, $is_enabled);
         
         # Add OFF indicator for disabled fields
-        my $status_indicator = $is_enabled ? "" : " [OFF]";
+        # my $status_indicator = $is_enabled ? "" : " [OFF]"; # Takes up too much space
+        my $status_indicator = '';
         
         # Build display text with glyph and value
         my $display_text = sprintf("%s %s:%s%s  ", $g, $highlighted_name, $value_str, $status_indicator);
@@ -401,7 +973,7 @@ sub draw_legend {
     
     for my $line_idx (0..$legend_lines_needed-1) {
         my $r = $legend_start_row + $line_idx;
-        print gotorc($r, 1), bg256($barbg), fg256(231);
+        print gotorc($r, 1), $barbg, fg256(231);
         
         my $line_content = " ";
         my $available_width = $COLS - 2;  # Account for padding
@@ -434,10 +1006,13 @@ sub draw_legend {
             my $display = $field->{text};
             if ($display =~ /^(\S+) (.+)$/) {
                 my ($glyph, $rest) = ($1, $2);
-                $line_content .= reset_attrs_str() . $color_code . $glyph . 
-                               reset_attrs_str() . bg256($barbg) . fg256(231) . " " . $rest;
+                $line_content .= $barbg . $color_code . $glyph . 
+                               $barbg . fg256(231) . " " . $rest;
+                # $line_content .= a_rst() . $color_code . $glyph . 
+                #                a_rst() . bg256($barbg) . fg256(231) . " " . $rest;
             } else {
-                $line_content .= reset_attrs_str() . bg256($barbg) . fg256(231) . $display;
+                $line_content .= $barbg . fg256(231) . $display;
+                # $line_content .= a_rst() . bg256($barbg) . fg256(231) . $display;
             }
             
             $current_line_length += $field->{length};
@@ -453,17 +1028,84 @@ sub draw_legend {
         $padding_needed = 0 if $padding_needed < 0;
         $line_content .= " " x $padding_needed;
         
-        print $line_content, reset_attrs_str(), clr_eol();
+        print $line_content, a_rst(), clr_eol();
         
         # If we've shown all fields, clear remaining legend lines
         if ($current_field >= @field_displays) {
             for my $remaining_line ($line_idx + 1..$legend_lines_needed-1) {
                 my $clear_r = $legend_start_row + $remaining_line;
-                print gotorc($clear_r, 1), bg256($barbg), fg256(231);
-                print " " x ($COLS - 1), reset_attrs_str(), clr_eol();
+                print gotorc($clear_r, 1), $barbg, fg256(231);
+                print " " x ($COLS - 1), a_rst(), clr_eol();
             }
             last;
         }
+    }
+}
+
+sub draw_footer {
+    return if $actual_footer_lines <= 0;
+    my $barbg = $a_footer_bg;
+    
+    for my $i (0..$actual_footer_lines-1) {
+        my $r = $ROWS - $actual_footer_lines + 1 + $i;
+        print gotorc($r,1), $barbg, fg256(231), bold();
+        my $label = "";
+        
+        if ($i == 0) {
+            my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw output";
+            my $raw_resize = $raw_output_active ? " +/-=resize" : "";
+            my $shortcuts_info = %fieldspec ? " [field/group keys active]" : "";
+            $label = " q=quit  N=toggle numbers  ^T=terminal input$raw_status$raw_resize$shortcuts_info  Fields: $S ";
+        } elsif ($i == 1 && $debug_msg) {
+            $label = $debug_msg;
+        }
+        
+        # Ensure label doesn't exceed terminal width
+        $label = substr($label, 0, $COLS - 1) if length($label) > $COLS - 1;
+        my $padding = $COLS - 1 - length($label);
+        $padding = 0 if $padding < 0;
+        my $line = $label . " " x $padding;
+        print $line, $barbg, clr_eol(), a_rst();
+    }
+}
+
+# ---------------- Render scaffolding ----------------
+sub clear_screen { print esc("2J") }
+
+sub set_debug($msg) {
+    $debug_msg = sprintf(" DEBUG[%d] $msg ", time()%1000);
+}
+
+sub full_redraw {
+    reset_scroll_region();
+    clear_screen();
+    set_debug("Redraw (plot:$cur_plot_top-$plot_bottom)");
+    
+    draw_header();
+    draw_legend();
+    draw_footer();
+    
+    if ($raw_output_active) {
+        clear_raw_output_area();
+    }
+}
+
+# ---------------- Input handling ----------------
+sub set_raw_tty {
+    system("stty -echo -icanon time 0 min 0 2>/dev/null"); # nonblocking read
+}
+
+sub restore_tty {
+    system("stty sane 2>/dev/null");
+}
+
+# ---------------- Data update ----------------
+sub step_series_demo {
+    for my $i (0..$S-1) {
+        my $step = (rand() - 0.5) * $vol[$i];
+        $values[$i] += $step;
+        push @{$hist[$i]}, $values[$i];
+        shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
     }
 }
 
@@ -498,14 +1140,14 @@ sub build_plot_row {
         if ($col >= 1 && $col <= $COLS) {
             # place only inside plot area; other cols remain spaces
             if ($col >= $plot_left && $col <= $plot_right) {
-                $buf[$col-1] = $color_code . $glyph . reset_attrs_str();
+                $buf[$col-1] = $color_code . $glyph . a_rst();
                 if ($inline_nums_on) {
                     my $num = ($i+1);
                     my $num_s = "$num";
                     for (my $k=0; $k<length($num_s); $k++) {
                         my $cc = $col + $k;
                         last if $cc > $plot_right;  # stay within plot boundaries
-                        $buf[$cc-1] = $color_code . substr($num_s,$k,1) . reset_attrs_str();
+                        $buf[$cc-1] = $color_code . substr($num_s,$k,1) . a_rst();
                     }
                 }
             }
@@ -516,12 +1158,12 @@ sub build_plot_row {
     my $border_col = 244;
     # Left border: one column before plot area
     if ($plot_left-1 >= 1) {
-        $buf[$plot_left-2] = fg256($border_col) . '│' . reset_attrs_str();
+        $buf[$plot_left-2] = fg256($border_col) . '│' . a_rst();
     }
     # Right border: one column after plot area  
     my $right_border_col = $plot_right + 1;
     if ($right_border_col <= $COLS) {
-        $buf[$right_border_col-1] = fg256($border_col) . '│' . reset_attrs_str();
+        $buf[$right_border_col-1] = fg256($border_col) . '│' . a_rst();
     }
     
     # Return the visible line covering the whole width
@@ -544,3 +1186,220 @@ sub window_minmax {
     if ($hi - $lo < 1e-6) { $hi += 1; $lo -= 1 }
     return ($lo,$hi);
 }
+
+# ---------------- Main ----------------
+$| = 1;
+hide_cursor();
+my $cleaned = 0;
+
+sub cleanup {
+    return if $cleaned;
+    save_state();  # Save state on exit
+    print a_rst();
+    reset_scroll_region();
+    show_cursor();
+    print gotorc($ROWS,1), "\n";
+    close($serial_fh) if $serial_fh;
+    $cleaned = 1;
+}
+
+# WINCH handler: recompute layout and redraw
+$SIG{WINCH} = sub {
+    recompute_layout();
+    $need_redraw = 1;
+};
+
+# Die/quit handlers
+$SIG{INT}  = sub { cleanup(); restore_tty(); exit 130 };
+$SIG{TERM} = sub { cleanup(); restore_tty(); exit 143 };
+$SIG{__DIE__} = sub { cleanup(); restore_tty(); die @_ };
+
+# Load state and fieldspec
+load_state();
+if ($opt{fieldspec}) {
+    load_fieldspec($opt{fieldspec}) or warn "Failed to load fieldspec: $opt{fieldspec}\n";
+}
+
+# Initialize data and serial
+init_data();
+unless ($opt{demo_mode}) {
+    eval { open_serial_port(); };
+    if ($@) {
+        set_debug("Serial failed, using demo mode: $@");
+        $opt{demo_mode} = 1;
+        init_data();
+    }
+}
+
+# Initial layout & draw
+recompute_layout();
+full_redraw();
+set_raw_tty();
+
+# Nonblocking input + main loop
+require Time::HiRes;
+my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
+
+my $legend_update_counter = 0;
+
+while (1) {
+    my $ch = '';
+    my $n = sysread(STDIN, $ch, 1);
+    if (defined $n && $n > 0) {
+        if ($input_active) {
+            # Handle input mode
+            my $ord_ch = ord($ch);
+            if ($ord_ch == 20) {  # ^T (Ctrl+T)
+                $input_active = 0;
+                recompute_layout();  # Recalculate layout without input
+                $need_redraw = 1;
+            } elsif ($ord_ch == 13 || $ord_ch == 10) {  # Enter
+                # Send the input
+                if (length($input_buffer) > 0) {
+                    send_serial_data($input_buffer) unless $opt{demo_mode};
+                    $input_buffer = "";
+                    $input_cursor = 0;
+                    draw_header();  # Update display but stay in input mode
+                }
+                # Stay in input mode - don't set $input_active = 0
+            } elsif ($ord_ch == 127 || $ord_ch == 8) {  # Backspace/Delete
+                if ($input_cursor > 0) {
+                    substr($input_buffer, $input_cursor - 1, 1) = '';
+                    $input_cursor--;
+                    draw_header();  # Immediate update
+                }
+            } elsif ($ord_ch == 27) {  # Escape - cancel input
+                $input_buffer = "";
+                $input_cursor = 0;
+                $input_active = 0;
+                recompute_layout();  # Recalculate layout without input
+                $need_redraw = 1;
+            } elsif ($ord_ch >= 32 && $ord_ch <= 126) {  # Printable characters
+                substr($input_buffer, $input_cursor, 0) = $ch;
+                $input_cursor++;
+                draw_header();  # Immediate update
+            }
+            # Arrow keys and other special handling could go here
+        } else {
+            # Handle normal mode
+            my $ord_ch = ord($ch);
+            if ($ch eq 'q') { 
+                last; 
+            } elsif ($ch eq 'N') {
+                $inline_nums_on = !$inline_nums_on;
+            } elsif ($ord_ch == 20) {  # ^T (Ctrl+T)
+                $input_active = 1;
+                $input_buffer = "";
+                $input_cursor = 0;
+                recompute_layout();  # Recalculate layout with input
+                $need_redraw = 1;
+            } elsif ($ord_ch == 4) {  # ^D (Ctrl+D)
+                $raw_output_active = !$raw_output_active;
+                if ($raw_output_active) {
+                    # Just opened - clear any buffered plot data
+                    @plot_data_buffer = ();
+                    $cur_plot_top = $raw_output_bottom+1;
+                } else {
+                    # Just closed - process any buffered plot data
+                    for my $buffered_data (@plot_data_buffer) {
+                        my ($names, $values) = @$buffered_data;
+                        update_fields($names, $values);
+                    }
+                    @plot_data_buffer = ();
+                    $cur_plot_top = $plot_top;
+                }
+                recompute_layout();
+                $need_redraw = 1;
+            } elsif ($ch eq '+' && $raw_output_active) {
+                # Increase raw output height
+                $raw_output_height += 2;
+                recompute_layout();
+                $need_redraw = 1;
+            } elsif ($ch eq '-' && $raw_output_active) {
+                # Decrease raw output height
+                $raw_output_height -= 2;
+                $raw_output_height = 3 if $raw_output_height < 3;  # minimum
+                recompute_layout();
+                $need_redraw = 1;
+            } elsif ($shortcut_to_group{$ch}) {
+                # Group toggle
+                toggle_group($shortcut_to_group{$ch});
+                recompute_layout();  # Recalculate in case legend size changed
+                $need_redraw = 1;
+            } elsif ($shortcut_to_field{$ch}) {
+                # Field toggle
+                toggle_field($shortcut_to_field{$ch});
+                recompute_layout();  # Recalculate in case legend size changed
+                $need_redraw = 1;
+            }
+        }
+    }
+    
+    if ($need_redraw) {
+        full_redraw();
+        $need_redraw = 0;
+    }
+    
+    # Read and process data
+    my $data_updated = 0;
+    if ($opt{demo_mode}) {
+        step_series_demo();
+        $data_updated = 1;
+    } else {
+        my @lines = read_serial_data();
+        for my $line (@lines) {
+            next if $line =~ /^\s*$/;  # Skip empty lines
+            
+            # Try to parse as plot data first
+            my ($names, $values) = parse_arduino_line($line);
+            if (@$names > 0) {
+                # This is valid plot data
+                push @plot_data_buffer, [$names, $values];
+                # Process plot data normally
+                $data_updated = update_fields($names, $values);
+            } else {
+                # This is not plot data - route to raw output if active
+                if ($raw_output_active) {
+                    output_raw_line($line);
+                }
+                # If raw output is not active, just ignore non-plot lines
+            }
+        }
+    }
+    
+    # Only plot if we have data, it was updated, and at least one field is enabled
+    if ($data_updated && $S > 0) {
+        # Check if any fields are enabled
+        my $any_enabled = 0;
+        for my $i (0..$S-1) {
+            my $field_name = $field_names[$i] // ($i + 1);
+            if (is_field_enabled($field_name)) {
+                $any_enabled = 1;
+                last;
+            }
+        }
+        
+        if ($any_enabled) {
+            my ($vmin,$vmax) = window_minmax();
+            # Build one row and print it at bottom of scroll region
+            my $row = build_plot_row($vmin,$vmax);
+            setup_plot_output_scroll();
+            print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
+        }
+        
+        # Update legend periodically to avoid interference with scrolling
+        $legend_update_counter++;
+        my $update_legend = $need_redraw || ($legend_update_counter % 10 == 0);  # Every 10th update
+        if ($update_legend) {
+            draw_legend();
+        }
+    }
+    
+    Time::HiRes::sleep($sleep_s) if $sleep_s > 0;
+}
+
+restore_tty();
+cleanup();
+exit 0;
+
+# vim: et ts=4
