@@ -931,8 +931,8 @@ sub draw_legend {
         
         # Approximate length for layout (ignoring color codes)
         my $approx_length = length($g) + 1 + length($field_name) + 1 + length($value_str) + 
-                           ($shortcut ? length($shortcut) + 2 : 0) + 
-                           ($is_enabled ? 0 : 6) + 3;  # 6 for " [OFF]"
+                           ($shortcut ? length($shortcut) + 2 : 0) + 3;
+                           # ($is_enabled ? 0 : 6) + 3;  # 6 for " [OFF]" takes too much space
         
         # Determine color from field config or default
         my $color;
