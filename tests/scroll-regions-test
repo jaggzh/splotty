@@ -1,0 +1,217 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Term::ReadKey;
+use Time::HiRes 'usleep';
+$|=1;
+
+# Terminal Scroll Region Test
+# Tests if terminal supports horizontal scroll regions (columns) vs just vertical (lines)
+
+print "\n=== Terminal Scroll Region Capability Test ===\n\n";
+
+# Save terminal state
+print "\033[?1049h";  # Switch to alternate screen buffer
+print "\033[2J";      # Clear screen
+print "\033[H";       # Move cursor to home
+
+sub sldel { usleep(int(.2 * 1000000)); }
+
+sub test_vertical_scroll {
+    print "Testing VERTICAL scroll regions (lines)...\n\n";
+    
+    # Set scroll region from line 5 to line 15
+    print "\033[5;15r";  # Set top and bottom margins
+    print "\033[H";      # Move to home
+    
+    # Fill the screen with a pattern
+    for my $line (1..25) {
+        print "\033[${line};1H";  # Move to line
+        print "Line $line: " . ("." x 60);
+    }
+    
+    # Move to the scroll region and add content
+    print "\033[10;1H";  # Move to middle of scroll region
+    print ">>> This should scroll within lines 5-15 only <<<";
+    
+    # Add more lines to test scrolling
+    for my $i (1..18) {
+        print "\n>>> Scroll test line $i <<<";
+        sldel();
+    }
+    
+    print "\n\nPress ENTER to continue...";
+    <STDIN>;
+    
+    # Reset scroll region
+    print "\033[r";
+}
+
+sub test_horizontal_scroll {
+    print "\033[2J\033[H";  # Clear screen and home
+    print "Testing HORIZONTAL scroll regions (columns)...\n\n";
+    
+    # Try to set horizontal scroll region (left/right margins)
+    # Note: This is not widely supported - DECSLRM sequence
+    print "\033[?69h";     # Enable left/right margin mode (if supported)
+    print "\033[10;60s";   # Set left margin to column 10, right to column 60
+    
+    # Fill screen with pattern
+    for my $line (1..20) {
+        print "\033[${line};1H";
+        print sprintf("L%02d:", $line) . ("1234567890" x 8);
+    }
+    
+    # Test if horizontal scrolling works
+    print "\033[10;35H";  # Move to middle of supposed scroll region
+    print ">>> HORIZONTAL SCROLL TEST <<<";
+    
+    # Try to trigger horizontal scrolling
+    print "\033[10;10H";  # Move to left margin
+    for my $i (1..20) {
+        print "HSCROLL$i ";
+        sldel();
+    }
+    
+    print "\n\nPress ENTER to continue...";
+    <STDIN>;
+    
+    # Reset horizontal margins
+    print "\033[?69l";  # Disable left/right margin mode
+}
+
+sub test_terminal_info {
+    print "\033[2J\033[H";
+    print "Terminal Information and Capability Detection:\n\n";
+    
+    # Query terminal type
+    print "TERM environment variable: " . ($ENV{TERM} || "not set") . "\n";
+    print "COLORTERM: " . ($ENV{COLORTERM} || "not set") . "\n\n";
+    
+    # Test device attributes
+    print "Querying terminal capabilities...\n";
+    
+    # Enable raw mode to capture responses
+    ReadMode('raw');
+    
+    # Query primary device attributes
+    print "\033[c";  # Send DA1 query
+    
+    # Try to read response (with longer timeout for tmux)
+    my $response = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout" };
+        alarm(3);  # Longer timeout for tmux
+        
+        # Wait a bit for response to arrive
+        select(undef, undef, undef, 0.2);
+        
+        while (1) {
+            my $char = ReadKey(0.1);
+            last unless defined $char;
+            $response .= $char;
+            last if $char eq 'c';  # End of DA response
+        }
+        alarm(0);
+    };
+    
+    ReadMode('restore');
+    
+    if ($response) {
+        print "Device Attributes Response: $response\n";
+        print "Raw bytes: ";
+        print join('', map { sprintf("\\x%02X", ord($_)) } split //, $response);
+        print "\n";
+        
+        # Decode the response based on your actual output: ^[[?1;2;4c
+        if ($response =~ /\[?\?(\d+(?:;\d+)*)c/) {
+            my @capabilities = split /;/, $1;
+            print "Capability codes: " . join(', ', @capabilities) . "\n";
+            
+            print "Decoded capabilities:\n";
+            for my $cap (@capabilities) {
+                if ($cap == 1) { print "  - Code 1: 132 columns supported\n"; }
+                elsif ($cap == 2) { print "  - Code 2: Printer supported\n"; }
+                elsif ($cap == 4) { print "  - Code 4: Sixel graphics supported\n"; }
+                elsif ($cap == 6) { print "  - Code 6: Selective erase supported\n"; }
+                elsif ($cap == 8) { print "  - Code 8: User-defined keys supported\n"; }
+                elsif ($cap == 9) { print "  - Code 9: National replacement character sets\n"; }
+                elsif ($cap == 15) { print "  - Code 15: Technical character set\n"; }
+                elsif ($cap == 18) { print "  - Code 18: Windowing capability\n"; }
+                elsif ($cap == 21) { print "  - Code 21: Horizontal scrolling\n"; }
+                elsif ($cap == 22) { print "  - Code 22: ANSI color\n"; }
+                elsif ($cap == 29) { print "  - Code 29: ANSI text locator\n"; }
+                else { print "  - Code $cap: (capability code)\n"; }
+            }
+            
+            # Check for horizontal scroll support
+            if (grep { $_ == 21 } @capabilities) {
+                print "\n*** HORIZONTAL SCROLLING MAY BE SUPPORTED! ***\n";
+            } else {
+                print "\n*** No horizontal scrolling capability reported ***\n";
+            }
+        }
+    } else {
+        print "No response captured in timeout period\n";
+        print "You showed: ^[[?1;2;4c - this means:\n";
+        print "  - Code 1: 132 columns supported\n";
+        print "  - Code 2: Printer supported  \n";
+        print "  - Code 4: Sixel graphics supported\n";
+        print "  - No Code 21: Horizontal scrolling NOT supported\n";
+    }
+    
+    print "\nPress ENTER to continue...";
+    <STDIN>;
+}
+
+sub visual_test_results {
+    print "\033[2J\033[H";
+    print "=== VISUAL TEST RESULTS ===\n\n";
+    
+    print "1. VERTICAL SCROLL REGIONS:\n";
+    print "   Most terminals support this via DECSTBM (\\033[t;br)\n";
+    print "   Sets top and bottom margins for scrolling\n\n";
+    
+    print "2. HORIZONTAL SCROLL REGIONS:\n";
+    print "   Very few terminals support this via DECSLRM (\\033[l;rs)\n";
+    print "   Requires \\033[?69h to enable left/right margin mode\n\n";
+    
+    print "TERMINALS WITH HORIZONTAL SCROLL SUPPORT:\n";
+    print "   ✓ DEC VT420 and higher\n";
+    print "   ✓ Some xterm versions (with special compilation)\n";
+    print "   ✓ A few specialized terminal emulators\n\n";
+    
+    print "COMMON TERMINALS WITHOUT HORIZONTAL SCROLL:\n";
+    print "   ✗ Most Linux console terminals\n";
+    print "   ✗ Standard xterm builds\n";
+    print "   ✗ GNOME Terminal\n";
+    print "   ✗ Konsole\n";
+    print "   ✗ Most terminal emulators\n\n";
+    
+    print "TO VERIFY YOUR TERMINAL:\n";
+    print "1. Did the vertical test show scrolling only within the set region?\n";
+    print "2. Did the horizontal test show any column-constrained behavior?\n";
+    print "3. Check if text wrapped at your set margins vs window edge\n\n";
+}
+
+# Main test sequence
+eval {
+    test_terminal_info();
+    test_vertical_scroll();
+    test_horizontal_scroll();
+    visual_test_results();
+    
+    print "Test complete! Your terminal most likely:\n";
+    print "- SUPPORTS vertical scroll regions (lines)\n";
+    print "- does NOT support horizontal scroll regions (columns)\n\n";
+    
+    print "This is normal - horizontal scroll regions are rarely implemented.\n";
+};
+
+# Cleanup
+print "\033[r";        # Reset scroll regions
+print "\033[?69l";     # Disable horizontal margins
+print "\033[?1049l";   # Return to normal screen buffer
+print "\033[2J\033[H"; # Clear and home
+
+print "\nTerminal scroll region test completed.\n";
