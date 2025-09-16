@@ -333,12 +333,32 @@ sub assign_auto_shortcuts {
     }
 }
 
+sub apply_single_group_to_fields {
+    my ($target_group_name) = @_;
+    return unless $fieldspec{groups} && $fieldspec{fields};
+    return unless exists $group_states{$target_group_name};
+    
+    my $group_state = $group_states{$target_group_name};
+    
+    # Apply this group's state to its fields only (skip hidden fields)
+    for my $field_name (keys %{$fieldspec{fields}}) {
+        my $field = $fieldspec{fields}->{$field_name};
+        next if $field->{hidden};  # Skip hidden fields
+        
+        my $field_groups = $field->{groups} // [];
+        
+        if (grep { $_ eq $target_group_name } @$field_groups) {
+            $field_states{$field_name} = $group_state;
+        }
+    }
+}
+
 sub toggle_group {
     my ($group_name) = @_;
     return unless exists $group_states{$group_name};
     
     $group_states{$group_name} = !$group_states{$group_name};
-    apply_group_states_to_fields();
+    apply_single_group_to_fields($group_name);  # Only apply this specific group
     set_debug("Toggled group '$group_name' to " . ($group_states{$group_name} ? 'ON' : 'OFF'));
 }
 
@@ -924,7 +944,7 @@ sub draw_legend {
             my $highlighted_name = highlight_field_name($group_name, $shortcut, $is_enabled);
             
             # Add status indicator
-            my $status_indicator = $is_enabled ? " [ON]" : " [OFF]";
+            my $status_indicator = $is_enabled ? "*" : " ";
             
             # Build display text
             my $display_text = sprintf("%s%s  ", $highlighted_name, $status_indicator);
