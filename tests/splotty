@@ -4,7 +4,6 @@ use warnings;
 use utf8;
 use Getopt::Long;
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
-
 binmode STDOUT, ':encoding(UTF-8)';
 
 # ---------------- CLI ----------------
@@ -18,7 +17,9 @@ my %opt = (
     serial_port => '/dev/ttyACM1',  # default serial port
     baud_rate => 115200,            # default baud rate
     demo_mode => 0,                 # use fake data instead of serial
+    legend_lines => 2,              # lines reserved for legend display
 );
+
 GetOptions(
     'header=i'      => \$opt{header},
     'footer=i'      => \$opt{footer},
@@ -29,6 +30,7 @@ GetOptions(
     'serial-port=s' => \$opt{serial_port},
     'baud-rate=i'   => \$opt{baud_rate},
     'demo!'         => \$opt{demo_mode},
+    'legend-lines=i' => \$opt{legend_lines},
 ) or die "Bad options\n";
 
 # ---------------- Term & ANSI helpers ----------------
@@ -62,12 +64,10 @@ sub term_size {
 
 # ---------------- Layout state ----------------
 my ($ROWS, $COLS) = term_size();
-
 my $need_redraw = 1;     # trigger full redraw
-my $inline_nums_on = 1;  # toggle with 'N' to show/hide per-glyph sensor numbers
+my $inline_nums_on = 0;  # toggle with 'N' to show/hide per-glyph sensor numbers
 my $min_plot_height = 6;
 my $debug_msg = "";      # debug message for footer
-my $legend_update_counter = 0;  # counter for legend updates
 
 # gutters
 my $yaxis_w   = 0;       # pure char plotting; no X/Y axes in the scroller row lines
@@ -77,6 +77,101 @@ my $pad_right = 1;       # small right pad
 # glyphs/colors
 my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
 my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
+
+# ---------------- Data ----------------
+my $S = $opt{series};
+my @values;          # current values (length S)
+my @field_names;     # field names for each series
+my @hist;            # history ring buffers per series (array of arrayrefs)
+my $hsize = $opt{window};
+
+# For demo mode - keep the original random data
+my @start = map { 50 + rand()*50 } (1..$S);
+my @vol   = map { 6 + rand()*6 }   (1..$S);
+
+# ---------------- Field Stability System ----------------
+my %field_configs;       # track different field configurations
+my $current_config_key = "";
+my $config_stability_count = 0;
+my $min_stability_count = 3;  # need to see config this many times before changing
+my $max_recent_configs = 10;   # keep track of recent configs
+
+sub get_config_key {
+    my ($names) = @_;
+    return join('|', @$names);
+}
+
+sub is_line_valid {
+    my ($line) = @_;
+    # Basic validation: should have at least one field with reasonable data
+    return 0 if length($line) < 3;  # too short
+    return 0 if $line =~ /^[\s\x00-\x1F]*$/;  # only whitespace/control chars
+    return 0 if length($line) > 1000;  # suspiciously long
+    
+    # Count fields - should have at least one valid field
+    my @fields = split /\t/, $line;
+    my $valid_fields = 0;
+    for my $field (@fields) {
+        if ($field =~ /^([^:]+):([+-]?(?:\d+\.?\d*|\.\d+))$/ ||
+            $field =~ /^([+-]?(?:\d+\.?\d*|\.\d+))$/) {
+            $valid_fields++;
+        }
+    }
+    
+    return $valid_fields > 0;
+}
+
+sub update_field_stability {
+    my ($new_names, $new_values) = @_;
+    
+    my $config_key = get_config_key($new_names);
+    
+    # Track this configuration
+    $field_configs{$config_key}++;
+    
+    # Clean up old configs if we have too many
+    if (keys %field_configs > $max_recent_configs) {
+        # Remove configs with lowest counts
+        my @sorted_configs = sort { $field_configs{$a} <=> $field_configs{$b} } keys %field_configs;
+        while (keys %field_configs > $max_recent_configs) {
+            my $to_remove = shift @sorted_configs;
+            delete $field_configs{$to_remove};
+        }
+    }
+    
+    # Check if this is the same as current config
+    if ($config_key eq $current_config_key) {
+        $config_stability_count++;
+    } else {
+        # Different config - check if it has enough stability
+        if ($field_configs{$config_key} >= $min_stability_count) {
+            # This config is stable enough, switch to it
+            $current_config_key = $config_key;
+            $config_stability_count = $field_configs{$config_key};
+            
+            # Actually update the fields
+            @field_names = @$new_names;
+            $S = @field_names;
+            @values = @$new_values;
+            @hist = map { [] } (0..$S-1);
+            $need_redraw = 1;
+            $debug_msg = "Fields changed to: " . join(", ", @field_names) . " (stability: $config_stability_count)";
+            return 1;  # indicate change happened
+        } else {
+            # Not stable enough yet, keep current config but update debug
+            $debug_msg = "New config seen: " . join(", ", @$new_names) . " (count: " . $field_configs{$config_key} . "/$min_stability_count)";
+            return 0;  # no change
+        }
+    }
+    
+    # Same config, just update values
+    if (@field_names > 0) {  # only if we have established fields
+        @values = @$new_values;
+        return 1;  # indicate data was updated
+    }
+    
+    return 0;
+}
 
 # ---------------- Serial Data ----------------
 my $serial_fh;
@@ -111,27 +206,20 @@ sub read_serial_data {
     
     my @lines;
     while ($serial_buffer =~ s/^([^\n]*)\n//) {
-        push @lines, $1;
+        my $line = $1;
+        $line =~ s/\r//g;  # remove carriage returns
+        push @lines, $line if is_line_valid($line);
     }
     
     return @lines;
 }
 
-# ---------------- Data ----------------
-my $S = $opt{series};
-my @values;          # current values (length S)
-my @field_names;     # field names for each series
-my @hist;            # history ring buffers per series (array of arrayrefs)
-my $hsize = $opt{window};
-
-# For demo mode - keep the original random data
-my @start = map { 50 + rand()*50 } (1..$S);
-my @vol   = map { 6 + rand()*6 }   (1..$S);
-
 sub init_data {
     if ($opt{demo_mode}) {
         # Initialize demo data
         @field_names = map { "field$_" } (1..$S);
+        $current_config_key = get_config_key(\@field_names);
+        $config_stability_count = $min_stability_count;
         for my $i (0..$S-1) {
             $values[$i] = $start[$i];
             $hist[$i]   = [];
@@ -142,6 +230,8 @@ sub init_data {
         @field_names = ();
         @hist = ();
         $S = 0;
+        $current_config_key = "";
+        $config_stability_count = 0;
     }
 }
 
@@ -175,115 +265,46 @@ sub parse_arduino_line {
 sub update_fields {
     my ($new_names, $new_values) = @_;
     
-    # Check if field structure has changed
-    my $structure_changed = 0;
-    if (@$new_names != @field_names) {
-        $structure_changed = 1;
-    } else {
-        for my $i (0..$#field_names) {
-            if ($field_names[$i] ne $new_names->[$i]) {
-                $structure_changed = 1;
-                last;
-            }
+    my $data_updated = update_field_stability($new_names, $new_values);
+    
+    if ($data_updated && @field_names > 0) {
+        # Update history
+        for my $i (0..$S-1) {
+            push @{$hist[$i]}, $values[$i];
+            shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
         }
+        
+        # Recompute layout
+        recompute_layout();
     }
     
-    if ($structure_changed) {
-        # Rebuild data structures
-        @field_names = @$new_names;
-        $S = @field_names;
-        @values = @$new_values;
-        @hist = map { [] } (0..$S-1);
-        $need_redraw = 1;
-        $debug_msg = "Fields changed: " . join(", ", @field_names);
-    } else {
-        # Update values
-        @values = @$new_values;
-    }
-    
-    # Update history
-    for my $i (0..$S-1) {
-        push @{$hist[$i]}, $values[$i];
-        shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
-    }
-    
-    # Recompute layout in case legend width changed
-    recompute_layout();
+    return $data_updated;
 }
 
 # ---------------- Mapping helpers ----------------
 my ($plot_top, $plot_bottom, $plot_height, $plot_left, $plot_right, $plot_width);
-my ($legend_col_start, $legend_width);
-my $last_legend_width = 0;
-
-sub calculate_legend_width {
-    return 16 if $S == 0;  # Default width when no data
-    
-    my $max_width = 0;
-    for my $i (0..$S-1) {
-        my $name = $field_names[$i] // ($i + 1);
-        my $value_str;
-        if (defined $values[$i]) {
-            # Format numbers based on magnitude for better display
-            my $val = $values[$i];
-            if (abs($val) >= 1000) {
-                $value_str = sprintf("%.0f", $val);
-            } elsif (abs($val) >= 100) {
-                $value_str = sprintf("%.1f", $val);
-            } elsif (abs($val) >= 10) {
-                $value_str = sprintf("%.2f", $val);
-            } else {
-                $value_str = sprintf("%.3f", $val);
-            }
-        } else {
-            $value_str = "-.---";
-        }
-        
-        # Format: "● fieldname: 123.4"
-        # 1 (glyph) + 1 (space) + length(name) + 2 (": ") + length(value)
-        my $line_width = 1 + 1 + length($name) + 2 + length($value_str);
-        $max_width = $line_width if $line_width > $max_width;
-    }
-    
-    # Add some padding and ensure minimum width
-    my $width = $max_width + 2;
-    return $width < 16 ? 16 : $width;
-}
+my ($legend_start_row);
 
 sub recompute_layout {
     ($ROWS,$COLS) = term_size();
-
-    my $avail = $ROWS - $opt{header} - $opt{footer};
+    
+    # Reserve space for header, footer, and legend
+    my $avail = $ROWS - $opt{header} - $opt{footer} - $opt{legend_lines};
     if ($avail < $min_plot_height) {
         # keep minimal usable region
-        $opt{header} = 0 if $ROWS < ($min_plot_height + $opt{footer});
-        $avail = $ROWS - $opt{header} - $opt{footer};
+        $opt{header} = 0 if $ROWS < ($min_plot_height + $opt{footer} + $opt{legend_lines});
+        $avail = $ROWS - $opt{header} - $opt{footer} - $opt{legend_lines};
         die "Not enough vertical space (rows=$ROWS)\n" if $avail < $min_plot_height;
     }
-
+    
     $plot_top    = $opt{header} + 1;
-    $plot_bottom = $ROWS - $opt{footer};
+    $legend_start_row = $ROWS - $opt{footer} - $opt{legend_lines} + 1;
+    $plot_bottom = $legend_start_row - 1;
     $plot_height = $plot_bottom - $plot_top + 1;
-
     $plot_left   = $yaxis_w + $pad_left + 1;      # 1-based columns
-    $legend_width = calculate_legend_width();     # dynamic width calculation
-    $plot_right  = $COLS - $pad_right - $legend_width - 3;  # space for: border(1) + gap(1) + legend(width)
+    $plot_right  = $COLS - $pad_right;
     $plot_right  = $plot_left if $plot_right < $plot_left;
     $plot_width  = $plot_right - $plot_left + 1;
-
-    $legend_col_start = $plot_right + 3;          # plot_area + border + gap + legend
-    # Ensure legend doesn't overflow terminal width
-    if ($legend_col_start + $legend_width > $COLS) {
-        $legend_col_start = $COLS - $legend_width;
-        $legend_col_start = 1 if $legend_col_start < 1;
-    }
-    
-    # Check if legend width changed and trigger redraw if needed
-    if ($legend_width != $last_legend_width) {
-        $need_redraw = 1;
-        $debug_msg = "Legend: $last_legend_width -> $legend_width, plot: $plot_left-$plot_right, legend: $legend_col_start" if $last_legend_width > 0;
-        $last_legend_width = $legend_width;
-    }
 }
 
 # Map value -> column within [plot_left, plot_right]
@@ -303,11 +324,75 @@ sub draw_header {
     for my $r (1..$opt{header}) {
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
         my $mode = $opt{demo_mode} ? "DEMO" : "SERIAL";
-        my $port_info = $opt{demo_mode} ? "" : " (ttyACM1\@115200)";
+        my $port_info = $opt{demo_mode} ? "" : " ($opt{serial_port}\@$opt{baud_rate})";
         my $label = $r==1 ? " Serial Data Plotter [$mode]$port_info " : "";
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         $line = substr($line, 0, $COLS-1);
         print $line, reset_attrs_str(), clr_eol();
+    }
+}
+
+sub draw_legend {
+    return if $opt{legend_lines} <= 0 || $S == 0;
+    
+    my $barbg = 236;  # Slightly different background for legend
+    
+    # Calculate how many fields per line
+    my $fields_per_line = int($COLS / 20);  # Rough estimate of 20 chars per field
+    $fields_per_line = 1 if $fields_per_line < 1;
+    
+    for my $line_idx (0..$opt{legend_lines}-1) {
+        my $r = $legend_start_row + $line_idx;
+        print gotorc($r, 1), bg256($barbg), fg256(231);
+        
+        my $line_content = " ";
+        if ($line_idx == 0) {
+            $line_content .= "Fields: ";
+        } else {
+            $line_content .= "        ";  # Indent continuation lines
+        }
+        
+        # Calculate which fields to show on this line
+        my $start_field = $line_idx * $fields_per_line;
+        my $end_field = ($line_idx + 1) * $fields_per_line - 1;
+        $end_field = $S - 1 if $end_field >= $S;
+        
+        if ($start_field < $S) {
+            for my $i ($start_field..$end_field) {
+                my $g = $glyphs[$i % @glyphs];
+                my $color = $colors[$i % @colors];
+                my $name = $field_names[$i] // ($i + 1);
+                
+                my $value_str;
+                if (defined $values[$i]) {
+                    # Format numbers based on magnitude for better display
+                    my $val = $values[$i];
+                    if (abs($val) >= 1000) {
+                        $value_str = sprintf("%.0f", $val);
+                    } elsif (abs($val) >= 100) {
+                        $value_str = sprintf("%.1f", $val);
+                    } elsif (abs($val) >= 10) {
+                        $value_str = sprintf("%.2f", $val);
+                    } else {
+                        $value_str = sprintf("%.3f", $val);
+                    }
+                } else {
+                    $value_str = "-.---";
+                }
+                
+                # Add glyph with color, then reset to legend background
+                $line_content .= reset_attrs_str() . fg256($color) . $g . reset_attrs_str() . bg256($barbg) . fg256(231);
+                $line_content .= sprintf(" %s:%s  ", $name, $value_str);
+            }
+        }
+        
+        # Pad the line and ensure it doesn't exceed terminal width
+        my $padding_needed = $COLS - 1 - length($line_content);
+        $padding_needed = 0 if $padding_needed < 0;
+        $line_content .= " " x $padding_needed;
+        $line_content = substr($line_content, 0, $COLS - 1) if length($line_content) > $COLS - 1;
+        
+        print $line_content, reset_attrs_str(), clr_eol();
     }
 }
 
@@ -317,10 +402,9 @@ sub draw_footer {
     for my $i (0..$opt{footer}-1) {
         my $r = $ROWS - $opt{footer} + 1 + $i;
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
-        my $gap = $legend_col_start - $plot_right - 1;
         my $label = "";
         if ($i == 0) {
-            $label = " Footer — q=quit  N=toggle field numbers  (Fields: $S, Legend: ${legend_width}ch, Gap: $gap) ";
+            $label = " q=quit  N=toggle field numbers  Fields: $S  Stability: $config_stability_count ";
         } elsif ($i == 1 && $debug_msg) {
             $label = " DEBUG: $debug_msg ";
         }
@@ -330,80 +414,27 @@ sub draw_footer {
     }
 }
 
-# Vertical legend gutter (right side)
-sub draw_legend_gutter {
-    my $start_row = $plot_top;
-    my $c = $legend_col_start;
-    my $max_legend_rows = $S;  # Only clear what we need
-    
-    # Clear only the legend area we're actually using
-    for my $i (0..$max_legend_rows) {
-        my $r = $start_row + $i;
-        last if $r > $plot_bottom;
-        print gotorc($r, $c), clr_eol();
-    }
-    
-    # Draw fields vertically
-    for my $i (0..$S-1) {
-        my $r = $start_row + $i;
-        last if $r > $plot_bottom;  # Don't overflow the plot area
-        
-        my $g = $glyphs[$i % @glyphs];
-        my $color = $colors[$i % @colors];
-        my $name = $field_names[$i] // ($i + 1);
-        
-        my $value_str;
-        if (defined $values[$i]) {
-            # Format numbers based on magnitude for better display
-            my $val = $values[$i];
-            if (abs($val) >= 1000) {
-                $value_str = sprintf("%.0f", $val);
-            } elsif (abs($val) >= 100) {
-                $value_str = sprintf("%.1f", $val);
-            } elsif (abs($val) >= 10) {
-                $value_str = sprintf("%.2f", $val);
-            } else {
-                $value_str = sprintf("%.3f", $val);
-            }
-        } else {
-            $value_str = "-.---";
-        }
-        
-        my $line = sprintf("%s%s%s %s: %s", 
-            fg256($color), $g, reset_attrs_str(), 
-            $name, $value_str);
-        
-        print gotorc($r, $c), $line;
-    }
-}
-
 # ---------------- Render scaffolding ----------------
 sub clear_screen { print esc("2J") }
 
 sub full_redraw {
     reset_scroll_region();
-    # Don't clear entire screen - preserve plot data
-    # clear_screen();
+    clear_screen();
     
-    # Clear and redraw only the fixed areas
     draw_header();
+    draw_legend();
     draw_footer();
-    
-    # Clear the legend area explicitly
-    for my $r ($plot_top..$plot_bottom) {
-        print gotorc($r, $legend_col_start), clr_eol();
-    }
     
     set_scroll_region($plot_top, $plot_bottom);
     # place cursor at bottom of region so printing a line will scroll up
     print gotorc($plot_bottom, 1);
-    draw_legend_gutter();
 }
 
 # ---------------- Input handling ----------------
 sub set_raw_tty {
     system("stty -echo -icanon time 0 min 0 2>/dev/null"); # nonblocking read
 }
+
 sub restore_tty {
     system("stty sane 2>/dev/null");
 }
@@ -416,8 +447,6 @@ sub step_series_demo {
         push @{$hist[$i]}, $values[$i];
         shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
     }
-    # Check if legend width needs to change
-    recompute_layout();
 }
 
 sub window_minmax {
@@ -440,7 +469,7 @@ sub build_plot_row {
     
     my $width = $plot_width;
     my @buf = (' ') x $COLS;
-
+    
     # draw series points
     for my $i (0..$S-1) {
         my $col = val_to_col($values[$i], $vmin, $vmax);
@@ -456,14 +485,14 @@ sub build_plot_row {
                     my $num_s = "$num";
                     for (my $k=0; $k<length($num_s); $k++) {
                         my $cc = $col + $k;
-                        last if $cc > $plot_right;  # stay within plot boundaries  # stay within plot boundaries
+                        last if $cc > $plot_right;  # stay within plot boundaries
                         $buf[$cc-1] = ($opt{no_color} ? "" : fg256($color)) . substr($num_s,$k,1) . reset_attrs_str();
                     }
                 }
-			}
+            }
         }
     }
-
+    
     # optional subtle left/right borders for the plot area
     my $border_col = 244;
     # Left border: one column before plot area
@@ -475,7 +504,7 @@ sub build_plot_row {
     if ($right_border_col <= $COLS) {
         $buf[$right_border_col-1] = fg256($border_col) . '│' . reset_attrs_str();
     }
-
+    
     # Return the visible line covering the whole width
     return join('', @buf[0..$COLS-1]);
 }
@@ -483,8 +512,8 @@ sub build_plot_row {
 # ---------------- Main ----------------
 $| = 1;
 hide_cursor();
-
 my $cleaned = 0;
+
 sub cleanup {
     return if $cleaned;
     print reset_attrs_str();
@@ -519,15 +548,15 @@ unless ($opt{demo_mode}) {
 
 # Initial layout & draw
 recompute_layout();
-# Clear screen once at startup
-clear_screen();
 full_redraw();
 set_raw_tty();
 
 # Nonblocking input + main loop
 require Time::HiRes;
 my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
-$sleep_s = 0.1 if $sleep_s == 0;  # Default to 100ms for serial reading
+# $sleep_s = 0.1 if $sleep_s == 0;  # Default to 100ms for serial reading
+
+my $legend_update_counter = 0;
 
 while (1) {
     my $ch = '';
@@ -535,15 +564,15 @@ while (1) {
     if (defined $n && $n > 0) {
         if ($ch eq 'q') { last; }
         if ($ch eq 'N') {
-        	$inline_nums_on = !$inline_nums_on;
+            $inline_nums_on = !$inline_nums_on;
         }
     }
-
+    
     if ($need_redraw) {
         full_redraw();
         $need_redraw = 0;
     }
-
+    
     # Read and process data
     my $data_updated = 0;
     if ($opt{demo_mode}) {
@@ -555,21 +584,18 @@ while (1) {
             next if $line =~ /^\s*$/;  # Skip empty lines
             my ($names, $values) = parse_arduino_line($line);
             if (@$names > 0) {
-                update_fields($names, $values);
-                $data_updated = 1;
-                last;  # Use the last valid line in this batch
+                $data_updated = update_fields($names, $values);
+                last if $data_updated;  # Use the first valid line that updates data
             }
         }
     }
-
+    
     # Only plot if we have data and it was updated
     if ($data_updated && $S > 0) {
         my ($vmin,$vmax) = window_minmax();
-
         # Build one row and print it at bottom of scroll region
         my $row = build_plot_row($vmin,$vmax);
         print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
-
         # Keep cursor at bottom inside region so LF scrolls only within region
         print gotorc($plot_bottom, 1);
         
@@ -577,10 +603,10 @@ while (1) {
         $legend_update_counter++;
         my $update_legend = $need_redraw || ($legend_update_counter % 10 == 0);  # Every 10th update
         if ($update_legend) {
-            draw_legend_gutter();
+            draw_legend();
         }
     }
-
+    
     Time::HiRes::sleep($sleep_s) if $sleep_s > 0;
 }
 
