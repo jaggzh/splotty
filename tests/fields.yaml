@@ -20,24 +20,40 @@ groups:
   1:
     key: 1
     state: true
-    order: 0
+    order: 1
   2:
     # key: 2
     key: "auto"
     state: true
-    order: 0
+    order: 1
+  1all:
+    key: "!"
+    state: false
+    order: 1
+  2all:
+    key: "@"
+    state: false
+    order: 1
   raw:
     key: "r"
     state: false
-    order: 1
+    order: 2
   btn:
     key: "b"
     state: false
-    order: 1
+    order: 2
   extra:
     key: "x"
     state: false
-    order: 1
+    order: 2
+  1extra:
+    key: "9"
+    state: false
+    order: 2
+  2extra:
+    key: "0"
+    state: false
+    order: 2
 
 state:
   start: true
@@ -81,7 +97,7 @@ state:
 fields:
   d1.Zraw:
     # d1.Zraw in groups 1 and 'raw'
-    groups: [1, "raw", "extra"]
+    groups: [1, "1all", "raw", "extra"]
     key: "auto"
     fg: 227
   d2.Zraw:
@@ -91,24 +107,46 @@ fields:
     bg24: [0, 0, 90]
     ch: "┇"
   d1.btn:
-    groups: [1, "btn"]
+    groups: [1, "1all", "btn"]
     key: "b"
   d2.btn:
     groups: [2, "btn"]
     key: "B"
   d1.chg_rate:
-    groups: [1, "extra"]
+    groups: [1, "1all", "extra", "1extra"]
     hidden: true
-    # hidden = no plot and don't display the fieldname in the UI
   d2.chg_rate:
-    groups: [2, "extra"]
+    groups: [2, "1all", "extra", "2extra"]
     hidden: true
   d1.humanPct:
-    groups: [1, "extra"]
-    hidden: true
+    groups: [1, "1all", "extra", "1extra"]
+    key: "auto"
   d2.humanPct:
-    groups: [2, "extra"]
-    hidden: true
+    groups: [2, "1all", "extra"]
+    key: "auto"
+  d1.Zsmooth:
+    groups: [1, "1all"]
+    key: "auto"
+  d1.min:
+    groups: [1, "1all"]
+    key: "auto"
+  d1.max:
+    groups: [1, "1all"]
+    key: "auto"
+  d1.TrigH:
+    groups: [1, "1all"]
+  d1.TrigL:
+    groups: [1, "1all"]
+  d2.Zsmooth:
+    groups: [2, "2all"]
+  d2.min:
+    groups: [2, "2all"]
+  d2.max:
+    groups: [2, "2all"]
+  d2.TrigH:
+    groups: [2, "2all"]
+  d2.TrigL:
+    groups: [2, "2all"]
 
   
 # Record of all fields is below, but they can be ignored.
