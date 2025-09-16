@@ -1,36 +1,119 @@
+1. Can you make me a module: String::ShortcutsAuto.pm?
+2. Modify splotty to use it and to load this yaml, and implement the
+grouping and selection/toggling behaviors and everything.
+  use FindBin;
+  use lib "$FindBin::RealBin/lib";
+  use String::ShortcutsAuto;
+
+
+# Splotty: Serial text-mode plotter
+# Field-groups plot state and quick-toggles configuration
+# Hitting key toggles entire group off (false) / on (true)
 groups:
   1:
-      key: 1
+    key: 1
+    state: true
+    order: 0
   2:
-      - key: 2
+    # key: 2
+    key: "auto"
+    state: true
+    order: 0
   raw:
-      - key: "r"
+    key: "r"
+    state: false
+    order: 1
   btn:
-      - key: "b"
+    key: "b"
+    state: false
+    order: 1
+  extra:
+    key: "x"
+    state: false
+    order: 1
 
+state:
+  start: true # all fields start enabled
+  # then group states applied in order (0 first)
+  # groups' fields in plotter then begin in that state,
+  #  and the key toggles their state, and all fields in
+  #  that group are set to that new state
+
+# ShortcutsAuto.pm: Used to map strings to chars, and the inverse map of
+#    chars to strings. When run directly, has a default test list of
+#    strings it runs itself on, OR accepts a list of strings as individual
+#    cli args, and outputs the resultant char mapping.
+# Used to choose shortcuts for our 'auto' groups and fields.
+#
+# Group and field keystrokes may be specified; the key is ADDED to the UI
+# shortcuts. A warning is output upon conflict for each conflict and that
+# keystroke is set to 'auto' mode.
+# If any conflicts, follow the list of warnings by a
+#   sleep($def_conflict_delay_s=1)
+# For 'auto' keystrokes, an algorithm is implemented which
+# analyzes all field names such that common prefix chars are
+# ranked lower. Thus, chars d, 1, 2, ., and z, end up lower.
+#   1. Go through all 'auto' fields:
+#      fields_highmean = 75% percentile of all lengths???
+#   2. Go through all 'auto' fields and calculate an
+#        "early-commonality". Something like this unfinished undeveloped..
+#   3. Module accepts a list of chars to exclude from candidates.
+#      In our application, we combine our UI keys and our manually-specified
+#      keys from the yaml for the exclude list.
+#   4. Module accepts 
+#   3. For each field:
+#      chars = split //, $fieldname
+#      for ci in (0 .. @chars):
+#        c = $chars[ci]
+#        c_commonality{c} += max(1,fields_highmean-ci))/fields_highmean
+#        I don't know how to do this all
+#   4. Fallback is to choose the first unassigned key.
+#   5. If no assigned key, we go through any available [a-z], then [0-9],
+#      then [A-Z].
 fields:
-  - "d1.Zraw":
-    - "groups":
-      - [1, "raw"] # d1.Zraw is in groups 1 and 'raw'
-  - "d2.Zraw":
-    - "groups":
-      - [2, "raw"]
+  d1.Zraw:
+    # d1.Zraw in groups 1 and 'raw'
+    groups: [1, "raw", "extra"]
+    key: "auto"
+    fg: 227
+  d2.Zraw:
+    groups: [2, "raw", "extra"]
+    key: "auto"
+    fg24: [255, 0, 255]
+    bg24: [0, 0, 90]
+    ch: "┇"
+  d1.btn:
+    groups: [1, "btn"]
+    key: "b"
+  d2.btn:
+    groups: [2, "btn"]
+    key: "B"
+  d1.chg_rate:
+    groups: [1, "extra"]
+  d2.chg_rate:
+    groups: [2, "extra"]
+  d1.humanPct:
+    groups: [1, "extra"]
+  d2.humanPct:
+    groups: [2, "extra"]
+
   
-# All fields I have to classify:
-d1.Zsmooth
-d1.min
-d1.max
-d1.TrigH
-d1.TrigL
-d1.btn
-d1.chg_rate
-d1.humanPct
-d2.Zraw
-d2.Zsmooth
-d2.min
-d2.max
-d2.TrigH
-d2.TrigL
-d2.btn
-d2.chg_rate
-d2.humanPct
+# Record of all fields is below, but they can be ignored.
+# Any fields not added to a group remain in the start state
+# d1.Zsmooth
+# d1.min
+# d1.max
+# d1.TrigH
+# d1.TrigL
+# d1.btn
+# d1.chg_rate
+# d1.humanPct
+# d2.Zraw
+# d2.Zsmooth
+# d2.min
+# d2.max
+# d2.TrigH
+# d2.TrigL
+# d2.btn
+# d2.chg_rate
+# d2.humanPct
