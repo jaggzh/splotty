@@ -1,16 +1,26 @@
-# In our state.yaml we store something like:
-# last_state:
-#   fieldspec_path: "..."
-#   groups: # Stores current group states selected by the user
-#           # when loaded, group states are merely their states for
-#           # handling the effect of toggling.
-#   fields: # stores individual field states. These will be each
-#           # actual field's enabled/disabled plot state
-#           # hidden: disables the field entirely, including its display and its plot
+# 1. Can you make me a module: String::ShortcutsAuto.pm?
+# 2. Modify splotty to use it and to load this yaml, and implement the
+# grouping and selection/toggling behaviors and everything.
+#   use FindBin;
+#   use lib "$FindBin::RealBin/lib";
+#   use String::ShortcutsAuto;
 
-# See below for an actual in-use file
+#   -f / --fieldspec file.yaml
+#   Last-used file path's resolved full path (symlinks need not be resolved, but the full non-relative path should be obtained) are stored in mkdir -p
+#   ~/.config/splotty/state.yaml (use a module to get OS's user config dir)
+#   state.yaml should have last_fieldspec_path: "...."
+#   last_state:
+#     fieldspec_path: "..."
+#     groups: # Stores current group states selected by the user
+#             # when loaded, group states are merely their states for
+#             # handling the effect of toggling.
+#     fields: # stores individual field states. These will be each
+#             # actual field's enabled/disabled plot state
 
-# Magnetometer sensor MCU project splotty fields spec file
+# Any questions?
+
+
+# Field spec file for magnetometer sensor project
 # for Splotty, a Serial text-mode plotter.
 #
 # Field-groups for plot state and quick-toggles configuration

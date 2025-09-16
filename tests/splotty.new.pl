@@ -4,6 +4,14 @@ use v5.36;
 use utf8;
 use Getopt::Long;
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use FindBin;
+use lib "$FindBin::RealBin/lib";
+use String::ShortcutsAuto qw(assign_shortcuts);
+use YAML::XS qw(LoadFile DumpFile);
+use File::HomeDir;
+use File::Path qw(make_path);
+use File::Spec;
+use Cwd 'abs_path';
 binmode STDOUT, ':encoding(UTF-8)';
 
 # ---------------- CLI ----------------
@@ -18,6 +26,7 @@ my %opt = (
     baud_rate => 115200,            # default baud rate
     demo_mode => 0,                 # use fake data instead of serial
     legend_lines => 2,              # lines reserved for legend display
+    fieldspec => '',                # fieldspec YAML file
 );
 
 GetOptions(
@@ -31,7 +40,245 @@ GetOptions(
     'baud-rate=i'   => \$opt{baud_rate},
     'demo!'         => \$opt{demo_mode},
     'legend-lines=i' => \$opt{legend_lines},
+    'fieldspec|f=s' => \$opt{fieldspec},
 ) or die "Bad options\n";
+
+# --- Configuration & State Management ---
+my $config_dir = File::Spec->catdir(File::HomeDir->my_home, '.config', 'splotty');
+my $state_file = File::Spec->catfile($config_dir, 'state.yaml');
+
+my %fieldspec = ();          # Loaded fieldspec configuration
+my %group_states = ();       # Current group on/off states
+my %field_states = ();       # Current field on/off states
+my %field_shortcuts = ();    # Field name -> keyboard shortcut
+my %group_shortcuts = ();    # Group name -> keyboard shortcut
+my %shortcut_to_field = ();  # Reverse mapping: shortcut -> field name
+my %shortcut_to_group = ();  # Reverse mapping: shortcut -> group name
+my $fieldspec_path = '';     # Resolved path to current fieldspec
+
+sub get_config_dir {
+    make_path($config_dir) unless -d $config_dir;
+    return $config_dir;
+}
+
+sub load_state {
+    return unless -f $state_file;
+    
+    eval {
+        my $state = LoadFile($state_file);
+        
+        # Load last used fieldspec if no fieldspec specified
+        if (!$opt{fieldspec} && $state->{last_fieldspec_path}) {
+            $opt{fieldspec} = $state->{last_fieldspec_path};
+        }
+        
+        # Load saved states if using same fieldspec
+        if ($state->{last_state} && 
+            $state->{last_state}->{fieldspec_path} eq abs_path($opt{fieldspec} // '')) {
+            %group_states = %{$state->{last_state}->{groups} // {}};
+            %field_states = %{$state->{last_state}->{fields} // {}};
+        }
+    };
+    warn "Failed to load state: $@" if $@;
+}
+
+sub save_state {
+    return unless $fieldspec_path;
+    
+    get_config_dir();  # Ensure directory exists
+    
+    my $state = {
+        last_fieldspec_path => $fieldspec_path,
+        last_state => {
+            fieldspec_path => $fieldspec_path,
+            groups => \%group_states,
+            fields => \%field_states,
+        }
+    };
+    
+    eval {
+        DumpFile($state_file, $state);
+    };
+    warn "Failed to save state: $@" if $@;
+}
+
+sub load_fieldspec {
+    my ($file) = @_;
+    return unless $file && -f $file;
+    
+    eval {
+        %fieldspec = %{LoadFile($file)};
+        $fieldspec_path = abs_path($file);
+        
+        # Initialize group states from fieldspec
+        if ($fieldspec{groups}) {
+            for my $group_name (keys %{$fieldspec{groups}}) {
+                my $group = $fieldspec{groups}->{$group_name};
+                $group_states{$group_name} //= $group->{state} // 1;
+                
+                if ($group->{key} && $group->{key} ne 'auto') {
+                    $group_shortcuts{$group_name} = $group->{key};
+                    $shortcut_to_group{$group->{key}} = $group_name;
+                }
+            }
+        }
+        
+        # Initialize field states and collect manual shortcuts
+        my %manual_field_shortcuts;
+        if ($fieldspec{fields}) {
+            for my $field_name (keys %{$fieldspec{fields}}) {
+                my $field = $fieldspec{fields}->{$field_name};
+                
+                # Field starts with global start state, then affected by groups
+                my $start_state = $fieldspec{state}->{start} // 1;
+                $field_states{$field_name} //= $start_state;
+                
+                if ($field->{key} && $field->{key} ne 'auto') {
+                    $manual_field_shortcuts{$field_name} = $field->{key};
+                }
+            }
+        }
+        
+        # Apply group states to fields in order
+        apply_group_states_to_fields();
+        
+        # Auto-assign shortcuts for 'auto' fields and groups
+        assign_auto_shortcuts(\%manual_field_shortcuts);
+        
+        set_debug("Loaded fieldspec: $file");
+    };
+    
+    if ($@) {
+        warn "Failed to load fieldspec '$file': $@";
+        return;
+    }
+    
+    return 1;
+}
+
+sub apply_group_states_to_fields {
+    return unless $fieldspec{groups} && $fieldspec{fields};
+    
+    # Get groups sorted by order
+    my @ordered_groups = sort { 
+        ($fieldspec{groups}->{$a}->{order} // 999) <=> 
+        ($fieldspec{groups}->{$b}->{order} // 999) 
+    } keys %{$fieldspec{groups}};
+    
+    # Apply group states to their fields
+    for my $group_name (@ordered_groups) {
+        my $group_state = $group_states{$group_name};
+        
+        for my $field_name (keys %{$fieldspec{fields}}) {
+            my $field = $fieldspec{fields}->{$field_name};
+            my $field_groups = $field->{groups} // [];
+            
+            if (grep { $_ eq $group_name } @$field_groups) {
+                $field_states{$field_name} = $group_state;
+            }
+        }
+    }
+}
+
+sub assign_auto_shortcuts {
+    my ($manual_field_shortcuts) = @_;
+    
+    # Collect all strings that need auto-assignment
+    my @auto_fields = ();
+    my @auto_groups = ();
+    
+    # Find auto fields
+    if ($fieldspec{fields}) {
+        for my $field_name (keys %{$fieldspec{fields}}) {
+            my $field = $fieldspec{fields}->{$field_name};
+            if (($field->{key} // '') eq 'auto') {
+                push @auto_fields, $field_name;
+            }
+        }
+    }
+    
+    # Find auto groups
+    if ($fieldspec{groups}) {
+        for my $group_name (keys %{$fieldspec{groups}}) {
+            my $group = $fieldspec{groups}->{$group_name};
+            if (($group->{key} // '') eq 'auto') {
+                push @auto_groups, $group_name;
+            }
+        }
+    }
+    
+    # Collect excluded keys (UI keys + manual assignments)
+    my @exclude = ('q', 'N', 'Q');  # Reserved UI keys
+    push @exclude, values %$manual_field_shortcuts;
+    push @exclude, values %group_shortcuts;
+    
+    # Assign shortcuts for auto fields
+    if (@auto_fields) {
+        my %auto_field_shortcuts = assign_shortcuts(
+            strings => \@auto_fields,
+            exclude => \@exclude,
+            manual => {},
+        );
+        
+        for my $field_name (@auto_fields) {
+            if (my $key = $auto_field_shortcuts{$field_name}) {
+                $field_shortcuts{$field_name} = $key;
+                $shortcut_to_field{$key} = $field_name;
+                push @exclude, $key;
+            }
+        }
+    }
+    
+    # Assign shortcuts for auto groups
+    if (@auto_groups) {
+        my %auto_group_shortcuts = assign_shortcuts(
+            strings => \@auto_groups,
+            exclude => \@exclude,
+            manual => {},
+        );
+        
+        for my $group_name (@auto_groups) {
+            if (my $key = $auto_group_shortcuts{$group_name}) {
+                $group_shortcuts{$group_name} = $key;
+                $shortcut_to_group{$key} = $group_name;
+            }
+        }
+    }
+    
+    # Add manual field shortcuts
+    for my $field_name (keys %$manual_field_shortcuts) {
+        my $key = $manual_field_shortcuts->{$field_name};
+        $field_shortcuts{$field_name} = $key;
+        $shortcut_to_field{$key} = $field_name;
+    }
+}
+
+sub toggle_group {
+    my ($group_name) = @_;
+    return unless exists $group_states{$group_name};
+    
+    $group_states{$group_name} = !$group_states{$group_name};
+    apply_group_states_to_fields();
+    set_debug("Toggled group '$group_name' to " . ($group_states{$group_name} ? 'ON' : 'OFF'));
+}
+
+sub toggle_field {
+    my ($field_name) = @_;
+    return unless exists $field_states{$field_name};
+    
+    $field_states{$field_name} = !$field_states{$field_name};
+    set_debug("Toggled field '$field_name' to " . ($field_states{$field_name} ? 'ON' : 'OFF'));
+}
+
+sub is_field_enabled {
+    my ($field_name) = @_;
+    return $field_states{$field_name} // 1;
+}
+
+sub get_field_config {
+    my ($field_name) = @_;
+    return $fieldspec{fields}->{$field_name} // {};
+}
 
 # ---------------- Term & ANSI helpers ----------------
 my $cur_area = '';
@@ -47,6 +294,8 @@ sub reset_scroll_region { print esc("r"); $cur_area = ''; }
 sub reset_attrs_str { esc("0m") }
 sub fg256 { my ($n)=@_; $opt{no_color} ? "" : esc("38;5;${n}m") }
 sub bg256 { my ($n)=@_; $opt{no_color} ? "" : esc("48;5;${n}m") }
+sub fg24 { my ($r,$g,$b)=@_; $opt{no_color} ? "" : esc("38;2;${r};${g};${b}m") }
+sub bg24 { my ($r,$g,$b)=@_; $opt{no_color} ? "" : esc("48;2;${r};${g};${b}m") }
 sub bold { $opt{no_color} ? "" : esc("1m") }
 sub a_raw_area { bg256(17) }
 
@@ -419,7 +668,8 @@ sub draw_header {
         print gotorc($r,1), bg256($barbg), fg256(231), bold();
         my $mode = $opt{demo_mode} ? "DEMO" : "SERIAL";
         my $port_info = $opt{demo_mode} ? "" : " ($opt{serial_port}\@$opt{baud_rate})";
-        my $label = $r==1 ? " Serial Data Plotter [$mode]$port_info " : "";
+        my $fieldspec_info = $fieldspec_path ? " [" . (split('/', $fieldspec_path))[-1] . "]" : "";
+        my $label = $r==1 ? " Serial Data Plotter [$mode]$port_info$fieldspec_info " : "";
         my $line  = sprintf(" %s%s", $label, "-" x ($COLS-1-length($label)));
         # $line = sprintf(" %s%s", $label, "-" x $dash_count);
         $line = substr($line, 0, $COLS-1);
@@ -432,11 +682,14 @@ sub draw_legend {
     
     my $barbg = 236;  # Slightly different background for legend
     
-    # Pre-calculate field display strings
+    # Pre-calculate field display strings (only for enabled fields)
     my @field_displays;
     for my $i (0..$S-1) {
-        my $g = $glyphs[$i % @glyphs];
-        my $name = $field_names[$i] // ($i + 1);
+        my $field_name = $field_names[$i] // ($i + 1);
+        next unless is_field_enabled($field_name);  # Skip disabled fields
+        
+        my $config = get_field_config($field_name);
+        my $g = $config->{ch} // $glyphs[$i % @glyphs];
         
         my $value_str;
         if (defined $values[$i]) {
@@ -455,15 +708,33 @@ sub draw_legend {
             $value_str = "-.---";
         }
         
-        # Calculate display length (glyph + space + name + colon + value + spaces)
-        my $display_text = sprintf("%s %s:%s  ", $g, $name, $value_str);
+        # Show keyboard shortcut if available
+        my $shortcut = $field_shortcuts{$field_name} // '';
+        my $shortcut_str = $shortcut ? "($shortcut)" : '';
+        
+        # Calculate display length
+        my $display_text = sprintf("%s %s:%s%s  ", $g, $field_name, $value_str, $shortcut_str);
         my $display_length = length($display_text);
+        
+        # Determine color from field config or default
+        my $color;
+        if ($config->{fg24}) {
+            # RGB color specified
+            $color = $config->{fg24};
+        } elsif (defined $config->{fg}) {
+            # 256-color specified
+            $color = $config->{fg};
+        } else {
+            # Default color
+            $color = $colors[$i % @colors];
+        }
         
         push @field_displays, {
             text => $display_text,
             length => $display_length,
-            color => $colors[$i % @colors],
-            index => $i
+            color => $color,
+            index => $i,
+            is_rgb => ref($color) eq 'ARRAY',
         };
     }
     
@@ -494,7 +765,14 @@ sub draw_legend {
             my $field = $field_displays[$current_field];
             
             # Add the field with proper color coding
-            $line_content .= reset_attrs_str() . fg256($field->{color}) . 
+            my $color_code;
+            if ($field->{is_rgb}) {
+                $color_code = fg24(@{$field->{color}});
+            } else {
+                $color_code = fg256($field->{color});
+            }
+            
+            $line_content .= reset_attrs_str() . $color_code . 
                            substr($field->{text}, 0, 1) .  # glyph
                            reset_attrs_str() . bg256($barbg) . fg256(231) .
                            substr($field->{text}, 1);      # rest of text
@@ -557,7 +835,8 @@ sub draw_footer {
         } elsif ($i == 0) {
             my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw output";
             my $raw_resize = $raw_output_active ? " +/-=resize" : "";
-            $label = " q=quit  N=toggle numbers  ^T=terminal$raw_status$raw_resize  Fields: $S ";
+            my $shortcuts_info = %fieldspec ? " [field/group keys active]" : "";
+            $label = " q=quit  N=toggle numbers  ^T=terminal$raw_status$raw_resize$shortcuts_info  Fields: $S ";
         } elsif ($i == 1 && $debug_msg) {
             $label = $debug_msg;
         }
@@ -615,6 +894,9 @@ sub step_series_demo {
 sub window_minmax {
     my ($lo,$hi) = (1e9, -1e9);
     for my $i (0..$S-1) {
+        my $field_name = $field_names[$i] // ($i + 1);
+        next unless is_field_enabled($field_name);  # Skip disabled fields
+        
         for my $v (@{$hist[$i]}) {
             $lo = $v if $v < $lo;
             $hi = $v if $v > $hi;
@@ -633,23 +915,36 @@ sub build_plot_row {
     my $width = $plot_width;
     my @buf = (' ') x $COLS;
     
-    # draw series points
+    # draw series points (only for enabled fields)
     for my $i (0..$S-1) {
+        my $field_name = $field_names[$i] // ($i + 1);
+        next unless is_field_enabled($field_name);  # Skip disabled fields
+        
         my $col = val_to_col($values[$i], $vmin, $vmax);
-        my $glyph = $glyphs[$i % @glyphs];
-        my $color = $colors[$i % @colors];
+        my $config = get_field_config($field_name);
+        my $glyph = $config->{ch} // $glyphs[$i % @glyphs];
+        
+        # Determine color from field config or default
+        my $color_code;
+        if ($config->{fg24}) {
+            $color_code = fg24(@{$config->{fg24}});
+        } elsif (defined $config->{fg}) {
+            $color_code = fg256($config->{fg});
+        } else {
+            $color_code = fg256($colors[$i % @colors]);
+        }
+        
         if ($col >= 1 && $col <= $COLS) {
-            my $cell = ($opt{no_color} ? "" : fg256($color)) . $glyph . reset_attrs_str();
             # place only inside plot area; other cols remain spaces
             if ($col >= $plot_left && $col <= $plot_right) {
-                $buf[$col-1] = ($opt{no_color} ? "" : fg256($color)) . $glyph . reset_attrs_str();
+                $buf[$col-1] = $color_code . $glyph . reset_attrs_str();
                 if ($inline_nums_on) {
                     my $num = ($i+1);
                     my $num_s = "$num";
                     for (my $k=0; $k<length($num_s); $k++) {
                         my $cc = $col + $k;
                         last if $cc > $plot_right;  # stay within plot boundaries
-                        $buf[$cc-1] = ($opt{no_color} ? "" : fg256($color)) . substr($num_s,$k,1) . reset_attrs_str();
+                        $buf[$cc-1] = $color_code . substr($num_s,$k,1) . reset_attrs_str();
                     }
                 }
             }
@@ -679,6 +974,7 @@ my $cleaned = 0;
 
 sub cleanup {
     return if $cleaned;
+    save_state();  # Save state on exit
     print reset_attrs_str();
     reset_scroll_region();
     show_cursor();
@@ -697,6 +993,12 @@ $SIG{WINCH} = sub {
 $SIG{INT}  = sub { cleanup(); restore_tty(); exit 130 };
 $SIG{TERM} = sub { cleanup(); restore_tty(); exit 143 };
 $SIG{__DIE__} = sub { cleanup(); restore_tty(); die @_ };
+
+# Load state and fieldspec
+load_state();
+if ($opt{fieldspec}) {
+    load_fieldspec($opt{fieldspec}) or warn "Failed to load fieldspec: $opt{fieldspec}\n";
+}
 
 # Initialize data and serial
 init_data();
@@ -796,6 +1098,14 @@ while (1) {
                 $raw_output_height = 3 if $raw_output_height < 3;  # minimum
                 recompute_layout();
                 $need_redraw = 1;
+            } elsif ($shortcut_to_group{$ch}) {
+                # Group toggle
+                toggle_group($shortcut_to_group{$ch});
+                $need_redraw = 1;
+            } elsif ($shortcut_to_field{$ch}) {
+                # Field toggle
+                toggle_field($shortcut_to_field{$ch});
+                $need_redraw = 1;
             }
         }
     }
@@ -832,13 +1142,26 @@ while (1) {
         }
     }
     
-    # Only plot if we have data, it was updated
+    # Only plot if we have data, it was updated, and at least one field is enabled
     if ($data_updated && $S > 0) {
-        my ($vmin,$vmax) = window_minmax();
-        # Build one row and print it at bottom of scroll region
-        my $row = build_plot_row($vmin,$vmax);
-		setup_plot_output_scroll();
-        print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
+        # Check if any fields are enabled
+        my $any_enabled = 0;
+        for my $i (0..$S-1) {
+            my $field_name = $field_names[$i] // ($i + 1);
+            if (is_field_enabled($field_name)) {
+                $any_enabled = 1;
+                last;
+            }
+        }
+        
+        if ($any_enabled) {
+            my ($vmin,$vmax) = window_minmax();
+            # Build one row and print it at bottom of scroll region
+            my $row = build_plot_row($vmin,$vmax);
+            setup_plot_output_scroll();
+            print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
+        }
+        
         # Update legend periodically to avoid interference with scrolling
         $legend_update_counter++;
         my $update_legend = $need_redraw || ($legend_update_counter % 10 == 0);  # Every 10th update
