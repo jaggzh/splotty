@@ -192,7 +192,11 @@ sub load_fieldspec {
                 my $start_state = $fieldspec{state}->{start} // 1;
                 $field_states{$field_name} //= $start_state;
                 
-                if ($field->{key} && $field->{key} ne 'auto') {
+                if (!exists $$field{key}) {
+                    if ($fieldspec{defaults}{fields}{key_auto}) {
+                        $$field{key} = 'auto';
+                    }
+                } elsif ($field->{key} && $field->{key} ne 'auto') {
                     $manual_field_shortcuts{$field_name} = $field->{key};
                 }
             }

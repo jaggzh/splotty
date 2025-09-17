@@ -22,15 +22,14 @@ groups:
     state: true
     order: 1
   2:
-    # key: 2
-    key: "auto"
+    key: 2
     state: true
     order: 1
-  1all:
+  1-All:
     key: "!"
     state: false
     order: 1
-  2all:
+  2-All:
     key: "@"
     state: false
     order: 1
@@ -94,10 +93,14 @@ state:
 #   4. Fallback is to choose the first unassigned key.
 #   5. If no assigned key, we go through any available [a-z], then [0-9],
 #      then [A-Z].
+defaults:
+  fields:
+    key_auto: true # fields with no "key:" get assigned auto instead of no assignment
+
 fields:
   d1.Zraw:
     # d1.Zraw in groups 1 and 'raw'
-    groups: [1, "1all", "raw", "extra"]
+    groups: [1, "1-All", "raw", "extra"]
     key: "auto"
     fg: 227
   d2.Zraw:
@@ -107,48 +110,47 @@ fields:
     bg24: [0, 0, 90]
     ch: "┇"
   d1.btn:
-    groups: [1, "1all", "btn"]
+    groups: [1, "1-All", "btn"]
     key: "b"
   d2.btn:
     groups: [2, "btn"]
     key: "B"
   d1.chg_rate:
-    groups: [1, "1all", "extra", "1extra"]
+    groups: [1, "1-All", "extra", "1extra"]
     hidden: true
   d2.chg_rate:
-    groups: [2, "1all", "extra", "2extra"]
+    groups: [2, "1-All", "extra", "2extra"]
     hidden: true
   d1.humanPct:
-    groups: [1, "1all", "extra", "1extra"]
+    groups: [1, "1-All", "extra", "1extra"]
     key: "auto"
   d2.humanPct:
-    groups: [2, "1all", "extra"]
+    groups: [2, "1-All", "extra"]
     key: "auto"
   d1.Zsmooth:
-    groups: [1, "1all"]
+    groups: [1, "1-All"]
     key: "auto"
   d1.min:
-    groups: [1, "1all"]
+    groups: [1, "1-All"]
     key: "auto"
   d1.max:
-    groups: [1, "1all"]
+    groups: [1, "1-All"]
     key: "auto"
   d1.TrigH:
-    groups: [1, "1all"]
+    groups: [1, "1-All"]
   d1.TrigL:
-    groups: [1, "1all"]
+    groups: [1, "1-All"]
   d2.Zsmooth:
-    groups: [2, "2all"]
+    groups: [2, "2-All"]
   d2.min:
-    groups: [2, "2all"]
+    groups: [2, "2-All"]
   d2.max:
-    groups: [2, "2all"]
+    groups: [2, "2-All"]
   d2.TrigH:
-    groups: [2, "2all"]
+    groups: [2, "2-All"]
   d2.TrigL:
-    groups: [2, "2all"]
+    groups: [2, "2-All"]
 
-  
 # Record of all fields is below, but they can be ignored.
 # Any fields not added to a group remain in the start state
 # d1.Zsmooth
