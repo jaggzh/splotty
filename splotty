@@ -15,6 +15,8 @@ use File::HomeDir;
 use File::Path qw(make_path);
 use File::Spec;
 use Cwd 'abs_path';
+use Time::HiRes;
+use POSIX qw(strftime);
 use Data::Dumper;
 binmode STDOUT, ':encoding(UTF-8)';
 
@@ -34,9 +36,10 @@ my %opt = (
     force     => 0,                 # force run, ignoring fieldspec path
     help => 0,                      # show help
 );
+my $logfile_debug = "log.splotty.txt";
 
 sub show_help {
-    print <<'EOF';
+    print <<"EOF";
 splotty: Serial-data Text-based Plotter
 
 USAGE:
@@ -57,6 +60,7 @@ OPTIONS:
     --wipe              Wipe stored fieldspec path
     --force             Force run, ignoring a bad fieldspec path
     --help              Show this help
+    --log               Log debug info to $logfile_debug
 
 CONTROLS (in plotter):
     q                   Quit
@@ -94,6 +98,7 @@ GetOptions(
     'wipe'          => \$opt{wipe},
     'force'         => \$opt{force},
     'help|h'        => \$opt{help},
+    'log'           => \$opt{log},
 ) or die "Bad options. Use --help for usage information.\n";
 
 show_help() if $opt{help};
@@ -110,6 +115,16 @@ my %group_shortcuts = ();    # Group name -> keyboard shortcut
 my %shortcut_to_field = ();  # Reverse mapping: shortcut -> field name
 my %shortcut_to_group = ();  # Reverse mapping: shortcut -> group name
 my $fieldspec_path = '';     # Resolved path to current fieldspec
+
+sub log_debug($msg) {
+    return if !$opt{log};
+    my $t = time;
+    my ($s,$ms) = (int($t), ($t-int($t))*1000);
+    my $ts = sprintf "%s.%03d", strftime("%H:%M:%S", localtime($s)), $ms;
+    open(my $lf, "+>", $logfile_debug) || die "Couldn't open log $logfile_debug: $!";
+    say $lf "[$ts] $msg";
+    close $lf;
+}
 
 sub get_config_dir {
     make_path($config_dir) unless -d $config_dir;
@@ -445,7 +460,9 @@ sub term_size {
 
 # ---------------- Layout state ----------------
 my ($ROWS, $COLS) = term_size();
-my $need_redraw = 1;     # trigger full redraw
+my $need_redraw = 1;       # trigger full redraw
+my $need_redraw_msg = '';  # Reason for redraw
+my $need_redraw_line = 0;  # Line of redraw requester
 my $inline_nums_on = 0;  # toggle with 'N' to show/hide per-glyph sensor numbers
 my $min_plot_height = 6;
 my $debug_msg = "";      # debug message for footer
@@ -490,6 +507,13 @@ my $config_stability_count = 0;
 my $min_stability_count = 3;  # need to see config this many times before changing
 my $max_recent_configs = 10;   # keep track of recent configs
 
+sub set_need_redraw($msg, $lineno=undef) {
+    my ($package, $filename, $line) = caller();
+    $need_redraw_msg = $msg;
+    $need_redraw_line = $lineno // $line;
+    $need_redraw=1;
+}
+
 sub get_config_key {
     my ($names) = @_;
     return join('|', @$names);
@@ -528,8 +552,8 @@ sub update_field_stability {
             $S = @field_names;
             @values = @$new_values;
             @hist = map { [] } (0..$S-1);
-            $need_redraw = 1;
-            set_debug("Fields changed to: " . join(", ", @field_names) . " (stability: $config_stability_count)");
+            set_need_redraw("Field count changed (stability: $config_stability_count)");
+            log_debug(join(", ", @$new_names));
             return 1;  # indicate change happened
         } else {
             # Not stable enough yet, keep current config but update debug
@@ -1242,7 +1266,7 @@ sub set_debug($msg) {
 sub full_redraw {
     reset_scroll_region();
     clear_screen();
-    set_debug("Redraw (plot:$cur_plot_top-$plot_bottom)");
+    set_debug("Redraw (plot:$cur_plot_top-$plot_bottom) (Line: $need_redraw_line, Reason: $need_redraw_msg)");
     
     draw_header();
     draw_legend();
@@ -1400,7 +1424,6 @@ full_redraw();
 set_raw_tty();
 
 # Nonblocking input + main loop
-require Time::HiRes;
 my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
 
 my $legend_update_counter = 0;
