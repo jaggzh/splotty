@@ -28,11 +28,11 @@ groups:
   1-All:
     key: "!"
     state: false
-    order: 1
+    order: 0
   2-All:
     key: "@"
     state: false
-    order: 1
+    order: 0
   raw:
     key: "r"
     state: false
