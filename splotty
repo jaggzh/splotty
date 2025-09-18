@@ -1,7 +1,12 @@
 #!/usr/bin/perl
 #!/usr/bin/perl -d
-# keep -d for forced debug on
 # splotty: Serial-data Text-based Plotter
+
+# keep -d for forced debug on
+
+# Use this to set a breakpoint (to return the term)
+#    restore_tty(); show_cursor(); $DB::single=1; set_raw_tty(); $need_redraw=1; hide_cursor();
+
 BEGIN { if (grep {/--debug/} @ARGV) { my @ARGS=grep {!/--debug/} @ARGV; exec($^X, "-d", __FILE__, @ARGS); } }
 use v5.36;
 use utf8;
@@ -15,7 +20,7 @@ use File::HomeDir;
 use File::Path qw(make_path);
 use File::Spec;
 use Cwd 'abs_path';
-use Time::HiRes;
+use Time::HiRes qw(gettimeofday);
 use POSIX qw(strftime);
 use Data::Dumper;
 binmode STDOUT, ':encoding(UTF-8)';
@@ -118,6 +123,7 @@ my %group_shortcuts = ();    # Group name -> keyboard shortcut
 my %shortcut_to_field = ();  # Reverse mapping: shortcut -> field name
 my %shortcut_to_group = ();  # Reverse mapping: shortcut -> group name
 my $fieldspec_path = '';     # Resolved path to current fieldspec
+my $input_underscore = '🥕';
 
 sub millis() {
     my ($s, $usec) = gettimeofday();
@@ -129,7 +135,10 @@ sub log_debug($msg) {
     return if !$opt{log};
     my ($t, $usec) = gettimeofday();
     my $ms = int($usec/1000);
-    my $ts = sprintf "%s.%03d", strftime("%H:%M:%S", localtime($t), $ms;
+    my $ts = sprintf "%s.%03d",
+        strftime("%H:%M:%S", localtime($t)),
+        $ms;
+
     open(my $lf, ">>", $logfile_debug) || die "Couldn't open log $logfile_debug: $!";
     say $lf "[$ts] $msg";
     close $lf;
@@ -435,8 +444,8 @@ sub a_raw_area { bg256(17) }
 
 # Color definitions for field name highlighting
 sub a_fieldname { fg256(253); }  # Normal field name color
-sub a_fieldname_disabled { $opt{no_color} ? "" : fg256(240) }  # Dimmed for disabled fields
-sub a_hotkey { $opt{no_color} ? "" : fg256(226) . bold() }  # Bright yellow for hotkey
+sub a_fieldname_disabled { $opt{no_color} ? "" : fg256(244) }  # Dimmed for disabled fields
+sub a_hotkey { $opt{no_color} ? "" : fg256(206) }  # Bright yellow for hotkey
 sub a_warn { esc("33;1m") }
 my $a_header_bg = bg256(237);
 my $a_footer_bg = bg24(0,0,90);
@@ -495,8 +504,27 @@ my $pad_left  = 1;       # small left pad
 my $pad_right = 1;       # small right pad
 
 # glyphs/colors
-my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
-my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
+# my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
+# my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
+my @glyphs = (
+    '●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◼','▴',
+    '♦','♠','♣','♥','★','☆','◉','◎','⬢','⬡','⬣','⬤','⬟','⚬','◘','◙',
+    '±','∞','∆','∇','※','‡','†','¤','⊙','⊚','⊛','⊜','⊝','⊞','⊟',
+    '►','◄','▼','▶','◊','╳','╬','┼','▪','▫','▬','▭','▮','▯','▰','▱',
+    '⟐','⟡','♪','♫','⌘','⊠','⊡','⟢','⟣','⟤','⟥','⟦','⟧','◣',
+    '◤','◥','◢','◐','◑','◒','◓','⬰','⬱','⬲','⬳','⭘','⭙','⭚','⭛','⭜'
+);
+
+my @colors = (
+    196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160,
+    124,197,198,202,203,209,210,211,
+    46,47,48,76,82,83,118,154,156,191,192,
+    12,18,19,20,21,26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
+    11,184,221,222,226,227,228,
+    135,165,171,177,207,213,219,225,
+    14,50,86,87,122,158,194,195
+);
+
 
 # ---------------- Data ----------------
 my $S = $opt{series};
@@ -845,7 +873,7 @@ sub draw_header {
             $display_cursor = $input_cursor - $start_pos;
         }
         
-        my $line = $prompt . $a_input . $display_buffer . '_';
+        my $line = $prompt . $a_input . $display_buffer . $input_underscore;
         # Pad to full width
         # $line .= " " x ($COLS - 1 - length($line)) if length($line) < $COLS - 1;
         print $line . clr_eol();
@@ -876,11 +904,12 @@ sub highlight_field_name {
     
     # Highlight the shortcut character in the field name
     my $highlighted_name = $field_name;
-    if ($highlighted_name =~ s/(\Q$shortcut\E)/a_hotkey() . $1 .${base_color}/ei) {
+    if ($highlighted_name =~ s/(\Q$shortcut\E)/a_hotkey() . $1 . ${base_color}/ei) {
         return $base_color . $highlighted_name;
     } else {
         # If shortcut not found in name, just append it
-        return $base_color . $field_name . "(" . a_hotkey() . $shortcut . a_fieldname() . ")";
+        return $base_color . $field_name . "(" . a_hotkey() . $shortcut .
+            a_rst() . $base_color .  ")";
     }
 }
 
@@ -1447,7 +1476,7 @@ my $legend_update_counter = 0;
 
 while (1) {
     my $key = ''; # Either a character or a sequence
-    my $combokey_delay_ms = 500; # Used for alt+key; tolerant to be done manually with ESC+key.
+    my $combokey_delay_ms = 70;
     my $combokey_start_ms = 0;
     my $combokey_sequence = '';
 
@@ -1470,15 +1499,14 @@ while (1) {
                 $combokey_start_ms = 0;
                 $key = $combokey_sequence; # Pass it through, even if it's short
             } else { # didn't time out, so add to sequence and refresh the timer
-                $combokey_sequence .= $ch;
+                $combokey_sequence .= $key;
                 $combokey_start_ms = $keytime;
             }
         } else { # char is available but we're not in a sequence
-            if ($ch eq "\033") {
+            if ($key eq "\033") {
                 $combokey_sequence = "\033";
-                $combokey_start_ms = $keytime;
+                $combokey_start_ms = $keytime; # Now we're in a sequence
             } else {
-                $key = $ch; # plain key. Pass it through
                 $combokey_start_ms = 0;  # make sure we're not in a sequence going forward
                 $combokey_sequence = ''; # Probably unnecessary to wipe
             }
@@ -1486,17 +1514,17 @@ while (1) {
     }
     if ($key) {
         my $ord_ch = -1;
-        $ord_ch = ord($key) if length $key > 1; # Only get ascii value if is single char
+        $ord_ch = ord($key) if length $key == 1; # Only get ascii value if is single char
         if ($input_active) { # Handle serial Send input mode
             # ^T and a blank enter will end input mode (unless that's disabled)
             if ($ord_ch == 20) {  # ^t (CTRL+t)
                 $input_active = 0;
                 draw_header();
-            } elsif (length($input_buffer)<1 && $opt{no_enter_ends_input} &&
+            } elsif (length($input_buffer)<1 && !$opt{no_enter_ends_input} &&
                     ($key eq "\n" || $key eq "\r")) {
                 $input_active = 0;
                 draw_header();
-            } elsif ($ord_ch == "\n" || $ord_ch == "\r") {  # Enter with something in buffer
+            } elsif ($key eq "\n" || $key eq "\r") {  # Enter with something in buffer
                 # Send the input (WITH the trailing enter)
                 if (length($input_buffer) > 0) {
                     send_serial_data("$input_buffer$key") unless $opt{demo_mode};
@@ -1529,7 +1557,7 @@ while (1) {
                 last; 
             } elsif ($key eq 'N') {
                 $inline_nums_on = !$inline_nums_on;
-            } elsif ($ord_ch == 20) {  # ^T (Ctrl+T)
+            } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
                 $input_active = 1;
                 $input_buffer = "";
                 $input_cursor = 0;
@@ -1564,7 +1592,8 @@ while (1) {
                 $raw_output_height = 3 if $raw_output_height < 3;  # minimum
                 recompute_layout();
                 $need_redraw = 1;
-            } elsif ($shortcut_to_group{$key}) {
+            } else {
+                if ($shortcut_to_group{$key}) {
                 # Group toggle
                 toggle_group($shortcut_to_group{$key});
                 # recompute_layout();  # Recalculate in case legend size changed
@@ -1574,7 +1603,7 @@ while (1) {
                 toggle_field($shortcut_to_field{$key});
                 # recompute_layout();  # Recalculate in case legend size changed
                 # $need_redraw = 1;
-            }
+            } }
         }
     }
     
