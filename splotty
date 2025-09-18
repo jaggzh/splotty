@@ -116,12 +116,18 @@ my %shortcut_to_field = ();  # Reverse mapping: shortcut -> field name
 my %shortcut_to_group = ();  # Reverse mapping: shortcut -> group name
 my $fieldspec_path = '';     # Resolved path to current fieldspec
 
+sub millis() {
+    my ($s, $usec) = gettimeofday();
+    my $ms = $s*1000 + int($usec/1000);
+    return $ms;
+}
+
 sub log_debug($msg) {
     return if !$opt{log};
-    my $t = time;
-    my ($s,$ms) = (int($t), ($t-int($t))*1000);
+    my ($t, $usec) = gettimeofday();
+    my $ms = int($usec/1000);
     my $ts = sprintf "%s.%03d", strftime("%H:%M:%S", localtime($s)), $ms;
-    open(my $lf, "+>", $logfile_debug) || die "Couldn't open log $logfile_debug: $!";
+    open(my $lf, ">>", $logfile_debug) || die "Couldn't open log $logfile_debug: $!";
     say $lf "[$ts] $msg";
     close $lf;
 }
@@ -543,6 +549,7 @@ sub update_field_stability {
     } else {
         # Different config - check if it has enough stability
         if ($field_configs{$config_key} >= $min_stability_count) {
+            my $legend_line_count_prev = calculate_legend_lines_needed();
             # This config is stable enough, switch to it
             $current_config_key = $config_key;
             $config_stability_count = $field_configs{$config_key};
@@ -552,7 +559,14 @@ sub update_field_stability {
             $S = @field_names;
             @values = @$new_values;
             @hist = map { [] } (0..$S-1);
-            set_need_redraw("Field count changed (stability: $config_stability_count)");
+
+            # Determine if we can avoid redrawing the whole screen
+            my $legend_line_count_new = calculate_legend_lines_needed();
+            if ($legend_line_count_new != $legend_line_count_prev) {
+                set_need_redraw("Field count changed (to " . scalar(@field_names) . "). Stability: $config_stability_count");
+            } else {
+                draw_legend();
+            }
             log_debug(join(", ", @$new_names));
             return 1;  # indicate change happened
         } else {
@@ -1430,8 +1444,19 @@ my $legend_update_counter = 0;
 
 while (1) {
     my $ch = '';
+    my $combokey_delay_ms = 500; # Used for alt+key; tolerant to be done manually with ESC+key.
+    my $combokey_start_ms = 0;
+
     my $n = sysread(STDIN, $ch, 1);
-    if (defined $n && $n > 0) {
+
+    if (!defined $n || $n < 0) { # No chars available
+    } else { # Char is available
+        if ($combokey_start_ms) { We had an ESC before
+
+    if (!$combokey_start_ms) {
+        if ($n == "\033") {
+            $combokey_start_ms = millis();
+        }
         if ($input_active) {
             # Handle input mode
             my $ord_ch = ord($ch);
