@@ -35,6 +35,7 @@ my %opt = (
     wipe      => 0,                 # wipe our stored fieldspec path
     force     => 0,                 # force run, ignoring fieldspec path
     help => 0,                      # show help
+    no_enter_ends_input => 0,       # Default is a blank enter exits Send mode
 );
 my $logfile_debug = "log.splotty.txt";
 
@@ -61,6 +62,8 @@ OPTIONS:
     --force             Force run, ignoring a bad fieldspec path
     --help              Show this help
     --log               Log debug info to $logfile_debug
+    --no-enter-ends-input  Default is that a blank enter ends input mode (send to serial)
+                           instead of just ^T again.
 
 CONTROLS (in plotter):
     q                   Quit
@@ -126,7 +129,7 @@ sub log_debug($msg) {
     return if !$opt{log};
     my ($t, $usec) = gettimeofday();
     my $ms = int($usec/1000);
-    my $ts = sprintf "%s.%03d", strftime("%H:%M:%S", localtime($s)), $ms;
+    my $ts = sprintf "%s.%03d", strftime("%H:%M:%S", localtime($t), $ms;
     open(my $lf, ">>", $logfile_debug) || die "Couldn't open log $logfile_debug: $!";
     say $lf "[$ts] $msg";
     close $lf;
@@ -1443,32 +1446,60 @@ my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
 my $legend_update_counter = 0;
 
 while (1) {
-    my $ch = '';
+    my $key = ''; # Either a character or a sequence
     my $combokey_delay_ms = 500; # Used for alt+key; tolerant to be done manually with ESC+key.
     my $combokey_start_ms = 0;
+    my $combokey_sequence = '';
 
-    my $n = sysread(STDIN, $ch, 1);
+    my $n = sysread(STDIN, $key, 1);
 
     if (!defined $n || $n < 0) { # No chars available
-    } else { # Char is available
-        if ($combokey_start_ms) { We had an ESC before
-
-    if (!$combokey_start_ms) {
-        if ($n == "\033") {
-            $combokey_start_ms = millis();
+        if ($combokey_start_ms) { # We had a combo key (ie. ESC) before
+            if (millis() - $combokey_start_ms > $combokey_delay_ms) {
+                # Timeout the sequence
+                $key = $combokey_sequence; # pass through the key alone
+                $combokey_sequence = '';
+                $combokey_start_ms = 0;
+            }
         }
-        if ($input_active) {
-            # Handle input mode
-            my $ord_ch = ord($ch);
-            if ($ord_ch == 20) {  # ^T (Ctrl+T)
+    } else { # Char is available
+        my $keytime = millis();
+           # We had an ESC before (len $combokey_sequence will also be >0)
+        if ($combokey_start_ms) {
+            if (millis() - $combokey_start_ms > $combokey_delay_ms) { # but it timed out.
+                $combokey_start_ms = 0;
+                $key = $combokey_sequence; # Pass it through, even if it's short
+            } else { # didn't time out, so add to sequence and refresh the timer
+                $combokey_sequence .= $ch;
+                $combokey_start_ms = $keytime;
+            }
+        } else { # char is available but we're not in a sequence
+            if ($ch eq "\033") {
+                $combokey_sequence = "\033";
+                $combokey_start_ms = $keytime;
+            } else {
+                $key = $ch; # plain key. Pass it through
+                $combokey_start_ms = 0;  # make sure we're not in a sequence going forward
+                $combokey_sequence = ''; # Probably unnecessary to wipe
+            }
+        }
+    }
+    if ($key) {
+        my $ord_ch = -1;
+        $ord_ch = ord($key) if length $key > 1; # Only get ascii value if is single char
+        if ($input_active) { # Handle serial Send input mode
+            # ^T and a blank enter will end input mode (unless that's disabled)
+            if ($ord_ch == 20) {  # ^t (CTRL+t)
                 $input_active = 0;
                 draw_header();
-                # recompute_layout();  # Recalculate layout without input
-                # $need_redraw = 1;
-            } elsif ($ord_ch == 13 || $ord_ch == 10) {  # Enter
-                # Send the input
+            } elsif (length($input_buffer)<1 && $opt{no_enter_ends_input} &&
+                    ($key eq "\n" || $key eq "\r")) {
+                $input_active = 0;
+                draw_header();
+            } elsif ($ord_ch == "\n" || $ord_ch == "\r") {  # Enter with something in buffer
+                # Send the input (WITH the trailing enter)
                 if (length($input_buffer) > 0) {
-                    send_serial_data($input_buffer) unless $opt{demo_mode};
+                    send_serial_data("$input_buffer$key") unless $opt{demo_mode};
                     $input_buffer = "";
                     $input_cursor = 0;
                     draw_header();  # Update display but stay in input mode
@@ -1484,20 +1515,19 @@ while (1) {
                 $input_buffer = "";
                 $input_cursor = 0;
                 $input_active = 0;
-                recompute_layout();  # Recalculate layout without input
+                draw_header();  # Immediate update
                 $need_redraw = 1;
             } elsif ($ord_ch >= 32 && $ord_ch <= 126) {  # Printable characters
-                substr($input_buffer, $input_cursor, 0) = $ch;
+                substr($input_buffer, $input_cursor, 0) = $key;
                 $input_cursor++;
                 draw_header();  # Immediate update
             }
             # Arrow keys and other special handling could go here
         } else {
             # Handle normal mode
-            my $ord_ch = ord($ch);
-            if ($ch eq 'q') { 
+            if ($key eq 'q') { 
                 last; 
-            } elsif ($ch eq 'N') {
+            } elsif ($key eq 'N') {
                 $inline_nums_on = !$inline_nums_on;
             } elsif ($ord_ch == 20) {  # ^T (Ctrl+T)
                 $input_active = 1;
@@ -1523,25 +1553,25 @@ while (1) {
                 }
                 recompute_layout();
                 $need_redraw = 1;
-            } elsif ($ch eq '+' && $raw_output_active) {
+            } elsif ($key eq '+' && $raw_output_active) {
                 # Increase raw output height
                 $raw_output_height += 2;
                 recompute_layout();
                 $need_redraw = 1;
-            } elsif ($ch eq '-' && $raw_output_active) {
+            } elsif ($key eq '-' && $raw_output_active) {
                 # Decrease raw output height
                 $raw_output_height -= 2;
                 $raw_output_height = 3 if $raw_output_height < 3;  # minimum
                 recompute_layout();
                 $need_redraw = 1;
-            } elsif ($shortcut_to_group{$ch}) {
+            } elsif ($shortcut_to_group{$key}) {
                 # Group toggle
-                toggle_group($shortcut_to_group{$ch});
+                toggle_group($shortcut_to_group{$key});
                 # recompute_layout();  # Recalculate in case legend size changed
                 # $need_redraw = 1;
-            } elsif ($shortcut_to_field{$ch}) {
+            } elsif ($shortcut_to_field{$key}) {
                 # Field toggle
-                toggle_field($shortcut_to_field{$ch});
+                toggle_field($shortcut_to_field{$key});
                 # recompute_layout();  # Recalculate in case legend size changed
                 # $need_redraw = 1;
             }
