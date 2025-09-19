@@ -1057,7 +1057,7 @@ sub draw_legend {
                 $available_width -= 8;
             }
             
-            my $current_line_length = 8;  # Start with prefix length
+            my $current_line_length = 0;  # Prefix len already removed
             
             # Add as many groups as will fit on this line
             while ($current_group < @group_displays && 
@@ -1219,7 +1219,7 @@ sub draw_legend {
             $available_width -= 8;
         }
         
-        my $current_line_length = 8;  # Start with prefix length
+        my $current_line_length = 0;  # "Fields:" len already removed
         
         # Add as many fields as will fit on this line
         while ($current_field < @field_displays && 
