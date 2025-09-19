@@ -226,7 +226,7 @@ sub load_fieldspec {
                 $field_states{$field_name} //= $start_state;
                 
                 if (!exists $$field{key}) {
-                    if ($fieldspec{defaults}{fields}{key_auto}) {
+                    if (!($fieldspec{defaults}{fields}{key_auto} // 1)) {
                         $$field{key} = 'auto';
                     }
                 } elsif ($field->{key} && $field->{key} ne 'auto') {
@@ -715,7 +715,7 @@ sub setup_plot_output_scroll {
 sub init_data {
     if ($opt{demo_mode}) {
         # Initialize demo data
-        @field_names = map { "field$_" } (1..$S);
+        @field_names = map { "f$_" } (1..$S);
         $current_config_key = get_config_key(\@field_names);
         $config_stability_count = $min_stability_count;
         for my $i (0..$S-1) {
@@ -931,20 +931,23 @@ sub calculate_group_lines_needed {
     my @display_groups = grep { $group_shortcuts{$_} } keys %{$fieldspec{groups}};
     return 0 if @display_groups == 0;
     
-    # Calculate group display lengths
-    my $total_length = 8;  # "Groups: " prefix
-    my $available_width = $COLS - 2;  # Account for padding
+    # Calculate group display lengths more accurately
+    my $total_length = 0;  # Start at 0, prefix already accounted for below
+    my $available_width = $COLS - 2 - 8;  # Account for padding AND prefix
     my $lines = 1;
     
     for my $group_name (@display_groups) {
         my $shortcut = $group_shortcuts{$group_name} // '';
         
-        # Calculate display text length (group name + shortcut + status + padding)
-        my $display_length = length($group_name) + 15;  # approximate length with shortcut and status
+        # Calculate display text length more accurately (matching draw_legend logic)
+        my $status_indicator = 1;  # "*" or " "
+        my $shortcut_chars = $shortcut ? length($shortcut) + 2 : 0;  # "(x)" format
+        my $padding = 3;  # spaces around text
+        my $display_length = length($group_name) + $status_indicator + $shortcut_chars + $padding;
         
         if ($total_length + $display_length > $available_width) {
             $lines++;
-            $total_length = 8 + $display_length;  # Reset with indent
+            $total_length = $display_length;  # Reset for new line
         } else {
             $total_length += $display_length;
         }
@@ -973,9 +976,9 @@ sub calculate_legend_lines_needed {
     if (@display_fields == 0) {
         $field_lines = 1;  # At least one line for "no fields to show"
     } else {
-        # Calculate field display lengths
-        my $total_length = 8;  # "Fields: " prefix
-        my $available_width = $COLS - 2;  # Account for padding
+        # Calculate field display lengths accurately
+        my $total_length = 0;  # Start at 0, prefix already accounted for below
+        my $available_width = $COLS - 2 - 8;  # Account for padding AND prefix
         $field_lines = 1;
         
         for my $i (@display_fields) {
@@ -983,12 +986,19 @@ sub calculate_legend_lines_needed {
             my $config = get_field_config($field_name);
             my $shortcut = $field_shortcuts{$field_name} // '';
             
-            # Calculate display text length (approximating highlighted chars)
-            my $display_length = length($field_name) + 20;  # glyph + value + padding + shortcut + OFF indicator
+            # Calculate display text length more accurately (matching draw_legend logic)
+            my $glyph_length = 1;  # One character for glyph
+            my $colon_space = 2;   # ": " after field name
+            my $value_length = 8;  # Approximate value display length (-.--- to 1234.567)
+            my $shortcut_chars = $shortcut ? length($shortcut) + 2 : 0;  # "(x)" format
+            my $padding = 3;       # Spaces around the whole thing
+            
+            my $display_length = $glyph_length + length($field_name) + $colon_space + 
+                               $value_length + $shortcut_chars + $padding;
             
             if ($total_length + $display_length > $available_width) {
                 $field_lines++;
-                $total_length = 8 + $display_length;  # Reset with indent
+                $total_length = $display_length;  # Reset for new line
             } else {
                 $total_length += $display_length;
             }

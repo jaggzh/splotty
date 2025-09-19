@@ -93,9 +93,11 @@ state:
 #   4. Fallback is to choose the first unassigned key.
 #   5. If no assigned key, we go through any available [a-z], then [0-9],
 #      then [A-Z].
-defaults:
-  fields:
-    key_auto: true # fields with no "key:" get assigned auto instead of no assignment
+#defaults:
+#  fields:
+#    key_auto: false
+#    # By default, fields are set to key:"auto" (auto-assign shortcut keys). Set this to false to make fields
+#    #  that have no "key" specified to NOT-ASSIGNED A SHORTCUT KEY.
 
 fields:
   d1.Zraw:
