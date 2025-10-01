@@ -36,6 +36,8 @@ my %opt = (
     serial_port => '/dev/ttyACM1',  # default serial port
     baud_rate => 115200,            # default baud rate
     demo_mode => 0,                 # use fake data instead of serial
+    stdin_mode => 0,                # read data from stdin
+    cmd => '',                      # command to execute and read from
     fieldspec => '',                # fieldspec YAML file
     wipe      => 0,                 # wipe our stored fieldspec path
     force     => 0,                 # force run, ignoring fieldspec path
@@ -61,6 +63,8 @@ OPTIONS:
     --serial-port=PATH  Serial port path (default: /dev/ttyACM1)
     --baud-rate=N       Baud rate (default: 115200)
     --demo              Use demo mode with fake data
+    --stdin             Read plot data from stdin (pipe/redirection)
+    --cmd=COMMAND       Execute command and read plot data from it
     --fieldspec=FILE    Load field specification YAML file
     -f FILE             Short form of --fieldspec
     --wipe              Wipe stored fieldspec path
@@ -70,10 +74,16 @@ OPTIONS:
     --no-enter-ends-input  Default is that a blank enter ends input mode (send to serial)
                            instead of just ^T again.
 
+DATA SOURCE MODES (mutually exclusive):
+    --demo              Generate random demo data
+    --stdin             Read data from stdin (keyboard input from /dev/tty)
+    --cmd=COMMAND       Read data from command output
+    (default)           Read data from serial port
+
 CONTROLS (in plotter):
     q                   Quit
     N                   Toggle inline numbers on plot points
-    ^T                  Toggle terminal input mode (send data to serial)
+    ^T                  Toggle terminal input mode (send data to serial - serial mode only)
     ^D                  Toggle raw serial output window
     +/-                 Resize raw output window (when active)
     [field keys]        Toggle individual fields (defined in fieldspec)
@@ -88,6 +98,8 @@ EXAMPLES:
     splotty -f fields.yaml                  # Load field configuration
     splotty --serial-port=/dev/ttyUSB0      # Different serial port
     splotty -f fields.yaml --demo           # Demo with field config
+    cat data.txt | splotty --stdin          # Read from pipe
+    splotty --cmd="./sensor-reader"         # Read from command
 EOF
     exit 0;
 }
@@ -102,14 +114,28 @@ GetOptions(
     'serial-port=s' => \$opt{serial_port},
     'baud-rate=i'   => \$opt{baud_rate},
     'demo!'         => \$opt{demo_mode},
+    'stdin!'        => \$opt{stdin_mode},
+    'cmd=s'         => \$opt{cmd},
     'fieldspec|f=s' => \$opt{fieldspec},
     'wipe'          => \$opt{wipe},
     'force'         => \$opt{force},
     'help|h'        => \$opt{help},
     'log'           => \$opt{log},
+    'no-enter-ends-input' => \$opt{no_enter_ends_input},
 ) or die "Bad options. Use --help for usage information.\n";
 
 show_help() if $opt{help};
+
+# Check for mutually exclusive data source options
+my $mode_count = ($opt{demo_mode} ? 1 : 0) + ($opt{stdin_mode} ? 1 : 0) + ($opt{cmd} ? 1 : 0);
+die "Cannot use --demo, --stdin, and --cmd together. Choose only one data source.\n" if $mode_count > 1;
+
+# ---------------- Data Source Configuration ----------------
+my $data_source_type = '';  # 'demo', 'stdin', 'cmd', 'serial'
+my $data_fh;                # Active data source filehandle
+my $data_buffer = '';       # Data accumulation buffer for line-oriented reading
+my $serial_fh;              # Serial-specific filehandle (for send operations)
+
 
 # ---------------- Configuration & State Management ----------------
 my $config_dir = File::Spec->catdir(File::HomeDir->my_home, '.config', 'splotty');
@@ -617,8 +643,40 @@ sub update_field_stability {
 }
 
 # ---------------- Serial Data ----------------
-my $serial_fh;
 my $serial_buffer = '';
+
+sub open_data_source {
+    # Determine data source type
+    if ($opt{demo_mode}) {
+        $data_source_type = 'demo';
+        set_debug("Using demo mode");
+        return;
+    } elsif ($opt{stdin_mode}) {
+        $data_source_type = 'stdin';
+        $data_fh = *STDIN;
+        
+        # Make stdin non-blocking
+        my $flags = fcntl($data_fh, F_GETFL, 0) or die "fcntl F_GETFL on stdin: $!\n";
+        fcntl($data_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL on stdin: $!\n";
+        
+        set_debug("Reading data from stdin");
+    } elsif ($opt{cmd}) {
+        $data_source_type = 'cmd';
+        
+        # Open command for reading
+        open($data_fh, "-|", $opt{cmd}) or die "Cannot execute command '$opt{cmd}': $!\n";
+        
+        # Make command pipe non-blocking
+        my $flags = fcntl($data_fh, F_GETFL, 0) or die "fcntl F_GETFL on command pipe: $!\n";
+        fcntl($data_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL on command pipe: $!\n";
+        
+        set_debug("Reading data from command: $opt{cmd}");
+    } else {
+        # Default to serial port
+        $data_source_type = 'serial';
+        open_serial_port();
+    }
+}
 
 sub open_serial_port {
     my $port = $opt{serial_port};
@@ -628,27 +686,28 @@ sub open_serial_port {
     system("stty -F $port $baud cs8 -cstopb -parity raw -echo") == 0
         or die "Failed to configure serial port $port: $!\n";
     
-    # Open the serial port
-    open($serial_fh, '+<', $port) or die "Cannot open serial port $port: $!\n";
+    # Open the serial port or file
+    open($data_fh, '+<', $port) or die "Cannot open serial port $port: $!\n";
     
     # Make it non-blocking
-    my $flags = fcntl($serial_fh, F_GETFL, 0) or die "fcntl F_GETFL: $!\n";
-    fcntl($serial_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL: $!\n";
+    my $flags = fcntl($data_fh, F_GETFL, 0) or die "fcntl F_GETFL: $!\n";
+    fcntl($data_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL: $!\n";
     
     set_debug("Opened $port at $baud baud");
 }
 
-sub read_serial_data {
-    return unless $serial_fh;
+sub read_data_source {
+    return unless $data_fh || $data_source_type eq 'demo';
+    return if $data_source_type eq 'demo';  # Demo data generated elsewhere
     
     my $data;
-    my $bytes_read = sysread($serial_fh, $data, 1024);
+    my $bytes_read = sysread($data_fh, $data, 1024);
     return unless defined $bytes_read && $bytes_read > 0;
     
-    $serial_buffer .= $data;
+    $data_buffer .= $data;
     
     my @lines;
-    while ($serial_buffer =~ s/^([^\n]*)\n//) {
+    while ($data_buffer =~ s/^([^\n]*)\n//) {
         my $line = $1;
         $line =~ s/\r//g;  # remove carriage returns
         push @lines, $line;
@@ -660,6 +719,12 @@ sub read_serial_data {
 sub send_serial_data {
     my ($data) = @_;
     return unless $serial_fh;
+    
+    # Check if we're in a mode that supports sending
+    if ($data_source_type ne 'serial') {
+        set_debug("Send not supported in $data_source_type mode");
+        return;
+    }
     
     # Add newline if not present
     $data .= "\n" unless $data =~ /\n$/;
@@ -713,7 +778,7 @@ sub setup_plot_output_scroll {
 }
 
 sub init_data {
-    if ($opt{demo_mode}) {
+    if ($data_source_type eq 'demo') {
         # Initialize demo data
         @field_names = map { "f$_" } (1..$S);
         $current_config_key = get_config_key(\@field_names);
@@ -723,7 +788,7 @@ sub init_data {
             $hist[$i]   = [];
         }
     } else {
-        # Initialize empty for serial data
+        # Initialize empty for piped/serial data
         @values = ();
         @field_names = ();
         @hist = ();
@@ -1463,13 +1528,13 @@ if ($opt{fieldspec}) {
     load_fieldspec($opt{fieldspec}) or warn "Failed to load fieldspec: $opt{fieldspec}\n";
 }
 
-# Initialize data and serial
+# Initialize data source
 init_data();
 unless ($opt{demo_mode}) {
-    eval { open_serial_port(); };
+    eval { open_data_source(); };
     if ($@) {
-        set_debug("Serial failed, using demo mode: $@");
-        $opt{demo_mode} = 1;
+        if ($@ && $data_source_type ne 'demo') {
+            die "open_data_source() failed: $@";
         init_data();
     }
 }
@@ -1484,13 +1549,23 @@ my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
 
 my $legend_update_counter = 0;
 
+# Open keyboard input source based on mode
+my $kb_input_fh;
+if ($opt{stdin_mode}) {
+    # When reading data from stdin, get keyboard from /dev/tty
+    open($kb_input_fh, "<", "/dev/tty") || die "Can't open /dev/tty: $!";
+} else {
+    # Otherwise use stdin for keyboard
+    $kb_input_fh = *STDIN;
+}
+
 while (1) {
     my $key = ''; # Either a character or a sequence
     my $combokey_delay_ms = 70;
     my $combokey_start_ms = 0;
     my $combokey_sequence = '';
 
-    my $n = sysread(STDIN, $key, 1);
+    my $n = sysread($kb_input_fh, $key, 1);
 
     if (!defined $n || $n < 0) { # No chars available
         if ($combokey_start_ms) { # We had a combo key (ie. ESC) before
@@ -1530,6 +1605,14 @@ while (1) {
             if ($ord_ch == 20) {  # ^t (CTRL+t)
                 $input_active = 0;
                 draw_header();
+            } elsif (($ord_ch == 20) {  # ^T (CTRL+t)
+                # Check if input mode is supported
+                if ($data_source_type ne 'serial') {
+                    set_debug("Terminal input (^T) only available in serial mode");
+                } else {
+                    $input_active = 0;
+                    draw_header();
+                }
             } elsif (length($input_buffer)<1 && !$opt{no_enter_ends_input} &&
                     ($key eq "\n" || $key eq "\r")) {
                 $input_active = 0;
@@ -1537,7 +1620,7 @@ while (1) {
             } elsif ($key eq "\n" || $key eq "\r") {  # Enter with something in buffer
                 # Send the input (WITH the trailing enter)
                 if (length($input_buffer) > 0) {
-                    send_serial_data("$input_buffer$key") unless $opt{demo_mode};
+                    send_serial_data("$input_buffer$key");
                     $input_buffer = "";
                     $input_cursor = 0;
                     draw_header();  # Update display but stay in input mode
@@ -1568,11 +1651,16 @@ while (1) {
             } elsif ($key eq 'N') {
                 $inline_nums_on = !$inline_nums_on;
             } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
-                $input_active = 1;
-                $input_buffer = "";
-                $input_cursor = 0;
-                recompute_layout();  # Recalculate layout with input
-                draw_header();
+                # Check if input mode is supported
+                if ($data_source_type ne 'serial') {
+                    set_debug("Terminal input (^T) only available in serial mode");
+                } else {
+                    $input_active = 1;
+                    $input_buffer = "";
+                    $input_cursor = 0;
+                    recompute_layout();  # Recalculate layout with input
+                    draw_header();
+                }
                 # $need_redraw = 1;
             } elsif ($ord_ch == 4) {  # ^D (Ctrl+D)
                 $raw_output_active = !$raw_output_active;
@@ -1625,10 +1713,11 @@ while (1) {
     # Read and process data
     my $data_updated = 0;
     if ($opt{demo_mode}) {
+    if ($data_source_type eq 'demo') {
         step_series_demo();
         $data_updated = 1;
     } else {
-        my @lines = read_serial_data();
+        my @lines = read_data_source();
         for my $line (@lines) {
             next if $line =~ /^\s*$/;  # Skip empty lines
             
@@ -1684,4 +1773,4 @@ restore_tty();
 cleanup();
 exit 0;
 
-# vim: et ts=4
+# vim: et ts=4 sts=4 sw=4
