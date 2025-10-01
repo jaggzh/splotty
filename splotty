@@ -16,7 +16,8 @@ use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use FindBin;
 use lib "$FindBin::RealBin/lib";
 use String::ShortcutsAuto qw(assign_shortcuts);
-use YAML::XS qw(LoadFile DumpFile);
+use YAML::XS qw(LoadFile DumpFile Dump);
+use File::Slurper qw(write_text);
 use File::HomeDir;
 use File::Path qw(make_path);
 use File::Spec;
@@ -651,6 +652,38 @@ sub update_field_stability {
 
 sub write_fieldspec_template {
     return if $S == 0;  # No fields to write
+    my $header = <<~EOT;
+        # splotty fieldspec template YAML
+        #   Auto-generated
+        # groups:
+        #   # Name of group (eg. "All")
+        #   All:
+        #     # key: Optional key (instead of auto)
+        #     key: "A"
+        #     # state: Starting state of whole group.
+        #     state: true
+        #     # order: Order in which state applied.
+        #     order: 0
+        #   Something:
+        #     key: "S"
+        #     state: false
+        #     order: 0
+        # state:
+        #   # start: true by default (all fields start enabled)
+        #   start: true
+        # fields:
+        #   some_field_name:
+        #     # groups: [list of groups this field belongs to]
+        #     groups: ["All", "Something"]
+        #   another:
+        #     groups: ["All"]
+        #     # start: starting state of field
+        #     # hidden: don't show in ui
+        #     # key_auto: defaults to true
+        #     start: 0
+        #     hidden: true
+        #     key_auto: false
+        EOT
     
     my $tmpdir = File::Spec->tmpdir();
     my $timestamp = strftime("%H%M%S", localtime);
@@ -660,7 +693,7 @@ sub write_fieldspec_template {
     my %spec = (
         defaults => {
             fields => {
-                #key_auto => 1,
+                key_auto => 1,
             }
         },
         state => {
@@ -678,7 +711,8 @@ sub write_fieldspec_template {
         
         # Build field entry
         my %field_entry = (
-            key => 'auto',
+            # key => 'auto',
+            groups => ['All'],
         );
         
         # Include current glyph and color if different from defaults
@@ -701,7 +735,8 @@ sub write_fieldspec_template {
     
     # Write the file
     eval {
-        DumpFile($filename, \%spec);
+        my $yaml = Dump(\%spec);
+        write_text($filename, "$header$yaml");
         set_debug("Wrote fieldspec template to: $filename");
     };
     
