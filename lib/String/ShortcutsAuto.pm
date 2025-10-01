@@ -2,6 +2,9 @@
 package String::ShortcutsAuto;
 use v5.36;
 use Exporter 'import';
+# use Data::Dumper; #debug
+# use bansi; #debug
+# sub pdd($v) { print Dumper($v) } #debug
 
 our @EXPORT_OK = qw(assign_shortcuts);
 our $VERSION = '1.0';
@@ -11,10 +14,16 @@ our $def_conflict_delay_s = 1;
 
 sub assign_shortcuts {
     my %args = @_;
+
     my $strings = $args{strings} // [];
     my $exclude = $args{exclude} // [];
     my $conflict_delay = $args{conflict_delay} // $def_conflict_delay_s;
     my $manual_assignments = $args{manual} // {};
+
+	# my $unique_count = keys %{{ map { $_ => 1 } @$strings }};
+	# say "Total strings: " . scalar(@$strings) . ", Unique: " . $unique_count;
+	# die;
+	# pdd(\%args);
     
     return {} unless @$strings;
     
@@ -52,6 +61,7 @@ sub assign_shortcuts {
     # Get list of strings that need auto-assignment
     my @auto_strings = grep { !exists $result{$_} } @$strings;
     return %result unless @auto_strings;
+    # die "Assigned: " . join(' ', keys %result) . "  Auto remaining: " . join(' ', @auto_strings);
     
     # Calculate commonality scores for auto-assignment
     my %char_commonality = _calculate_commonality(\@auto_strings);
@@ -62,12 +72,23 @@ sub assign_shortcuts {
     # Assign keys to auto strings
     for my $str (@auto_strings) {
         my $assigned_key = _find_best_key($str, \@candidates, \%char_commonality, \%used_keys);
-        if ($assigned_key) {
+        say "Assigning: $assigned_key";
+        if (defined $assigned_key) {
             $result{$str} = $assigned_key;
             $used_keys{$assigned_key} = 1;
+		} else {
+			warn "Failed to assign key to: '$str'\n";
+			warn "Available candidates: " . join(',', grep { !$used_keys{$_} } @candidates) . "\n";
         }
     }
-    
+
+	# for my $str (@$strings) {
+	# 	if (exists $result{$str}) { say "* $str => $result{$str}"; }
+	# 	else { say "  $red$str$rst"; }
+	# }
+	# say map { "Assigning: $result{$_} -> $_\n" }  keys %result;
+	# say "Count: " . scalar(keys %result);
+	# die;
     return %result;
 }
 

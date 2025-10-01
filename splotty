@@ -239,7 +239,8 @@ sub load_fieldspec {
                 my $group = $fieldspec{groups}->{$group_name};
                 $group_states{$group_name} //= $group->{state} // 1;
 
-                if ($group->{key} && $group->{key} ne 'auto') {
+                $group->{key} //= 'auto';
+                if ($group->{key} ne 'auto') {
                     $group_shortcuts{$group_name} = $group->{key};
                     $shortcut_to_group{$group->{key}} = $group_name;
                 }
@@ -260,7 +261,8 @@ sub load_fieldspec {
                 $field_states{$field_name} //= $start_state;
 
                 if (!exists $$field{key}) {
-                    if (!($fieldspec{defaults}{fields}{key_auto} // 1)) {
+                    if ( ! exists $fieldspec{defaults}{fields}{key_auto}
+                            || $fieldspec{defaults}{fields}{key_auto}) {
                         $$field{key} = 'auto';
                     }
                 } elsif ($field->{key} && $field->{key} ne 'auto') {
@@ -372,7 +374,7 @@ sub assign_auto_shortcuts {
         );
 
         for my $field_name (@auto_fields) {
-            if (my $key = $auto_field_shortcuts{$field_name}) {
+            if (defined( my $key = $auto_field_shortcuts{$field_name} )) {
                 $field_shortcuts{$field_name} = $key;
                 $shortcut_to_field{$key} = $field_name;
                 push @exclude, $key;
@@ -389,7 +391,7 @@ sub assign_auto_shortcuts {
         );
 
         for my $group_name (@auto_groups) {
-            if (my $key = $auto_group_shortcuts{$group_name}) {
+            if (defined( my $key = $auto_group_shortcuts{$group_name})) {
                 $group_shortcuts{$group_name} = $key;
                 $shortcut_to_group{$key} = $group_name;
             }
@@ -1112,11 +1114,11 @@ sub highlight_field_name {
     my ($field_name, $shortcut, $is_enabled) = @_;
 
     my $base_color = $is_enabled ? a_fieldname() : a_fieldname_disabled();
-    return $base_color . $field_name  unless $shortcut;
+    return $base_color . $field_name  unless defined $shortcut;
 
     # Highlight the shortcut character in the field name
     my $highlighted_name = $field_name;
-    if ($highlighted_name =~ s/(\Q$shortcut\E)/a_hotkey() . $1 . ${base_color}/ei) {
+    if ($highlighted_name =~ s/(\Q$shortcut\E)/a_hotkey() . $shortcut . ${base_color}/e) {
         return $base_color . $highlighted_name;
     } else {
         # If shortcut not found in name, just append it
@@ -1655,7 +1657,7 @@ sub cleanup {
     reset_scroll_region();
     show_cursor();
     print gotorc($ROWS,1), "\n";
-    close($data_fh) if $data_fh;
+    # close($data_fh) if $data_fh;
     if ($opt{stdin_mode} || $opt{cmd}) {
         system("stty -F /dev/tty sane 2>/dev/null");
     }
@@ -1676,7 +1678,7 @@ $SIG{__DIE__} = sub { cleanup(); restore_tty(); die @_ };
 # Load state and fieldspec
 load_state();
 if ($opt{fieldspec}) {
-    load_fieldspec($opt{fieldspec}) or warn "Failed to load fieldspec: $opt{fieldspec}\n";
+    load_fieldspec($opt{fieldspec}) or die "Failed to load fieldspec: $opt{fieldspec}\n";
 }
 
 # Initialize data source
@@ -1750,7 +1752,7 @@ while (1) {
             }
         }
     }
-    if ($key) {
+    if (defined $key && length $key) {
         my $ord_ch = -1;
         $ord_ch = ord($key) if length $key == 1; # Only get ascii value if is single char
         if ($input_active) { # Handle serial Send input mode
