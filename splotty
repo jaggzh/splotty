@@ -24,6 +24,7 @@ use Cwd 'abs_path';
 use Time::HiRes qw(gettimeofday);
 use POSIX qw(strftime);
 use Data::Dumper;
+use List::Util 'shuffle';
 binmode STDOUT, ':encoding(UTF-8)';
 
 # ---------------- CLI ----------------
@@ -140,8 +141,6 @@ die "Cannot use --demo, --stdin, and --cmd together. Choose only one data source
 my $data_source_type = '';  # 'demo', 'stdin', 'cmd', 'serial'
 my $data_fh;                # Active data source filehandle
 my $data_buffer = '';       # Data accumulation buffer for line-oriented reading
-my $serial_fh;              # Serial-specific filehandle (for send operations)
-
 
 # ---------------- Configuration & State Management ----------------
 my $config_dir = File::Spec->catdir(File::HomeDir->my_home, '.config', 'splotty');
@@ -539,7 +538,7 @@ my $pad_right = 1;       # small right pad
 # my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
 # my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
 my @glyphs = (
-    '●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◼','▴',
+    '●','◆','■','▲','○','◇','□','△','▣','✶','✦','▸','◼','▴',
     '♦','♠','♣','♥','★','☆','◉','◎','⬢','⬡','⬣','⬤','⬟','⚬','◘','◙',
     '±','∞','∆','∇','※','‡','†','¤','⊙','⊚','⊛','⊜','⊝','⊞','⊟',
     '►','◄','▼','▶','◊','╳','╬','┼','▪','▫','▬','▭','▮','▯','▰','▱',
@@ -551,10 +550,10 @@ my @colors = (
     196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160,
     124,197,198,202,203,209,210,211,
     46,47,48,76,82,83,118,154,156,191,192,
-    12,18,19,20,21,26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
+    12,19,20,21,26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
     11,184,221,222,226,227,228,
     135,165,171,177,207,213,219,225,
-    14,50,86,87,122,158,194,195
+    14,50,86,87,122,158,195,97
 );
 
 
@@ -724,7 +723,7 @@ sub read_data_source {
 
 sub send_serial_data {
     my ($data) = @_;
-    return unless $serial_fh;
+    return unless $data_fh;
 
     # Check if we're in a mode that supports sending
     if ($data_source_type ne 'serial') {
@@ -736,8 +735,8 @@ sub send_serial_data {
     $data .= "\n" unless $data =~ /\n$/;
 
     eval {
-        print $serial_fh $data;
-        $serial_fh->flush() if $serial_fh->can('flush');
+        print $data_fh $data;
+        $data_fh->flush() if $data_fh->can('flush');
     };
 
     if ($@) {
@@ -782,6 +781,50 @@ sub setup_plot_output_scroll {
         $cur_area = 'plot';
     }
 }
+
+sub replay_history {
+    return if $S == 0;  # No data yet
+    
+    # Find the minimum history depth across all series
+    my $history_depth = 0;
+    for my $i (0..$S-1) {
+        my $depth = scalar @{$hist[$i]};
+        $history_depth = $depth if $history_depth == 0 || $depth < $history_depth;
+    }
+    
+    return if $history_depth == 0;  # No history to replay
+    
+    # Replay min(history_depth, plot_height) rows
+    my $rows_to_replay = $history_depth < $plot_height ? $history_depth : $plot_height;
+    my $start_idx = $history_depth - $rows_to_replay;
+    
+    # Calculate range for the entire history we're replaying
+    my ($vmin, $vmax) = window_minmax();
+    
+    # Temporarily disable scrolling to place rows directly
+    reset_scroll_region();
+    
+    # Save current values
+    my @saved_values = @values;
+    
+    for my $row_idx (0..$rows_to_replay-1) {
+        my $hist_idx = $start_idx + $row_idx;
+        my $screen_row = $cur_plot_top + $row_idx;
+        
+        # Set values to this historical point
+        for my $i (0..$S-1) {
+            $values[$i] = $hist[$i]->[$hist_idx] if $hist_idx < @{$hist[$i]};
+        }
+        
+        my $row = build_plot_row($vmin, $vmax);
+        print gotorc($screen_row, 1), $row, clr_eol();
+    }
+    
+    # Restore current values and scrolling
+    @values = @saved_values;
+    setup_plot_output_scroll();
+}
+
 
 sub init_data {
     if ($data_source_type eq 'demo') {
@@ -839,7 +882,7 @@ sub update_fields {
         # Update history
         for my $i (0..$S-1) {
             push @{$hist[$i]}, $values[$i];
-            shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
+            shift @{$hist[$i]} while @{$hist[$i]} > $hsize*3;
         }
 
         # Recompute layout
@@ -1366,10 +1409,10 @@ sub draw_footer {
         my $label = "";
 
         if ($i == 0) {
-            my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw output";
+            my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw panel";
             my $raw_resize = $raw_output_active ? " +/-=resize" : "";
-            my $shortcuts_info = %fieldspec ? " [field/group keys active]" : "";
-            $label = " q=quit  N=toggle numbers  ^T=terminal input$raw_status$raw_resize$shortcuts_info  Fields: $S ";
+            my $shortcuts_info = %fieldspec ? " [fld/grp keys active]" : "";
+            $label = " q=quit N=toggle numbers ^T=Term.input$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs";
         } elsif ($i == 1 && $debug_msg) {
             $label = $debug_msg;
         }
@@ -1398,10 +1441,10 @@ sub full_redraw {
     draw_header();
     draw_legend();
     draw_footer();
-
     if ($raw_output_active) {
         clear_raw_output_area();
     }
+    replay_history();
 }
 
 # ---------------- Input handling ----------------
@@ -1513,7 +1556,10 @@ sub cleanup {
     reset_scroll_region();
     show_cursor();
     print gotorc($ROWS,1), "\n";
-    close($serial_fh) if $serial_fh;
+    close($data_fh) if $data_fh;
+    if ($opt{stdin_mode} || $opt{cmd}) {
+        system("stty -F /dev/tty sane 2>/dev/null");
+    }
     $cleaned = 1;
 }
 
@@ -1561,6 +1607,7 @@ my $kb_input_fh;
 if ($opt{stdin_mode}) {
     # When reading data from stdin, get keyboard from /dev/tty
     open($kb_input_fh, "<", "/dev/tty") || die "Can't open /dev/tty: $!";
+    system("stty -F /dev/tty -echo -icanon time 0 min 0 2>/dev/null");
 } else {
     # Otherwise use stdin for keyboard
     $kb_input_fh = *STDIN;
@@ -1657,6 +1704,8 @@ while (1) {
                 last;
             } elsif ($key eq 'N') {
                 $inline_nums_on = !$inline_nums_on;
+            } elsif ($ord_ch == 25) {  # ^Y (CTRL+y)
+                @colors = shuffle @colors;
             } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
                 # Check if input mode is supported
                 if ($data_source_type ne 'serial') {
