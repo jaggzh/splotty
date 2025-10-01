@@ -64,9 +64,6 @@ OPTIONS:
     --no-color          Disable color output
     --serial-port=PATH  Serial port path (default: /dev/ttyACM1)
     --baud-rate=N       Baud rate (default: 115200)
-    --demo              Use demo mode with fake data
-    --stdin             Read plot data from stdin (pipe/redirection)
-    --cmd=COMMAND       Execute command and read plot data from it
     --fieldspec=FILE    Load field specification YAML file
     -f FILE             Short form of --fieldspec
     --wipe              Wipe stored fieldspec path
@@ -186,17 +183,17 @@ sub get_config_dir {
 
 sub load_state {
     return unless -f $state_file;
-    
+
     eval {
         my $state = LoadFile($state_file);
-        
+
         # Load last used fieldspec if no fieldspec specified
         if (!$opt{fieldspec} && $state->{last_state} && $state->{last_state}->{fieldspec_path}) {
             $opt{fieldspec} = $state->{last_state}->{fieldspec_path};
         }
-        
+
         # Load saved states if using same fieldspec
-        if ($state->{last_state} && 
+        if ($state->{last_state} &&
             $state->{last_state}->{fieldspec_path} eq abs_path($opt{fieldspec} // '')) {
             %group_states = %{$state->{last_state}->{groups} // {}};
             %field_states = %{$state->{last_state}->{fields} // {}};
@@ -207,7 +204,7 @@ sub load_state {
 
 sub save_state {
     return unless $fieldspec_path;
-    
+
     get_config_dir();  # Ensure directory exists
     my $state = {};
     if (defined $fieldspec_path) {
@@ -219,7 +216,7 @@ sub save_state {
             }
         };
     }
-    
+
     eval {
         DumpFile($state_file, $state);
     };
@@ -229,37 +226,37 @@ sub save_state {
 sub load_fieldspec {
     my ($file) = @_;
     return unless $file && -f $file;
-    
+
     eval {
         %fieldspec = %{LoadFile($file)};
         $fieldspec_path = abs_path($file);
-        
+
         # Initialize group states from fieldspec
         if ($fieldspec{groups}) {
             for my $group_name (keys %{$fieldspec{groups}}) {
                 my $group = $fieldspec{groups}->{$group_name};
                 $group_states{$group_name} //= $group->{state} // 1;
-                
+
                 if ($group->{key} && $group->{key} ne 'auto') {
                     $group_shortcuts{$group_name} = $group->{key};
                     $shortcut_to_group{$group->{key}} = $group_name;
                 }
             }
         }
-        
+
         # Initialize field states and collect manual shortcuts (skip hidden fields)
         my %manual_field_shortcuts;
         if ($fieldspec{fields}) {
             for my $field_name (keys %{$fieldspec{fields}}) {
                 my $field = $fieldspec{fields}->{$field_name};
-                
+
                 # Skip hidden fields - they don't get state or shortcuts
                 next if $field->{hidden};
-                
+
                 # Field starts with global start state, then affected by groups
                 my $start_state = $fieldspec{state}->{start} // 1;
                 $field_states{$field_name} //= $start_state;
-                
+
                 if (!exists $$field{key}) {
                     if (!($fieldspec{defaults}{fields}{key_auto} // 1)) {
                         $$field{key} = 'auto';
@@ -269,16 +266,16 @@ sub load_fieldspec {
                 }
             }
         }
-        
+
         # Apply group states to fields in order
         apply_group_states_to_fields();
-        
+
         # Auto-assign shortcuts for 'auto' fields and groups
         assign_auto_shortcuts(\%manual_field_shortcuts);
-        
+
         set_debug("Loaded fieldspec: $file");
     };
-    
+
     if ($@) {
         my $err = <<~"EOT";
             Failed to load fieldspec '$file': $@
@@ -300,29 +297,29 @@ sub load_fieldspec {
         }
         return;
     }
-    
+
     return 1;
 }
 
 sub apply_group_states_to_fields {
     return unless $fieldspec{groups} && $fieldspec{fields};
-    
+
     # Get groups sorted by order
-    my @ordered_groups = sort { 
-        ($fieldspec{groups}->{$a}->{order} // 999) <=> 
-        ($fieldspec{groups}->{$b}->{order} // 999) 
+    my @ordered_groups = sort {
+        ($fieldspec{groups}->{$a}->{order} // 999) <=>
+        ($fieldspec{groups}->{$b}->{order} // 999)
     } keys %{$fieldspec{groups}};
-    
+
     # Apply group states to their fields (skip hidden fields)
     for my $group_name (@ordered_groups) {
         my $group_state = $group_states{$group_name};
-        
+
         for my $field_name (keys %{$fieldspec{fields}}) {
             my $field = $fieldspec{fields}->{$field_name};
             next if $field->{hidden};  # Skip hidden fields
-            
+
             my $field_groups = $field->{groups} // [];
-            
+
             if (grep { $_ eq $group_name } @$field_groups) {
                 $field_states{$field_name} = $group_state;
             }
@@ -332,23 +329,23 @@ sub apply_group_states_to_fields {
 
 sub assign_auto_shortcuts {
     my ($manual_field_shortcuts) = @_;
-    
+
     # Collect all strings that need auto-assignment
     my @auto_fields = ();
     my @auto_groups = ();
-    
+
     # Find auto fields (skip hidden fields)
     if ($fieldspec{fields}) {
         for my $field_name (keys %{$fieldspec{fields}}) {
             my $field = $fieldspec{fields}->{$field_name};
             next if $field->{hidden};  # Skip hidden fields
-            
+
             if (($field->{key} // '') eq 'auto') {
                 push @auto_fields, $field_name;
             }
         }
     }
-    
+
     # Find auto groups
     if ($fieldspec{groups}) {
         for my $group_name (keys %{$fieldspec{groups}}) {
@@ -358,12 +355,12 @@ sub assign_auto_shortcuts {
             }
         }
     }
-    
+
     # Collect excluded keys (UI keys + manual assignments)
     my @exclude = ('q', 'N', 'Q');  # Reserved UI keys
     push @exclude, values %$manual_field_shortcuts;
     push @exclude, values %group_shortcuts;
-    
+
     # Assign shortcuts for auto fields
     if (@auto_fields) {
         my %auto_field_shortcuts = assign_shortcuts(
@@ -371,7 +368,7 @@ sub assign_auto_shortcuts {
             exclude => \@exclude,
             manual => {},
         );
-        
+
         for my $field_name (@auto_fields) {
             if (my $key = $auto_field_shortcuts{$field_name}) {
                 $field_shortcuts{$field_name} = $key;
@@ -380,7 +377,7 @@ sub assign_auto_shortcuts {
             }
         }
     }
-    
+
     # Assign shortcuts for auto groups
     if (@auto_groups) {
         my %auto_group_shortcuts = assign_shortcuts(
@@ -388,7 +385,7 @@ sub assign_auto_shortcuts {
             exclude => \@exclude,
             manual => {},
         );
-        
+
         for my $group_name (@auto_groups) {
             if (my $key = $auto_group_shortcuts{$group_name}) {
                 $group_shortcuts{$group_name} = $key;
@@ -396,7 +393,7 @@ sub assign_auto_shortcuts {
             }
         }
     }
-    
+
     # Add manual field shortcuts
     for my $field_name (keys %$manual_field_shortcuts) {
         my $key = $manual_field_shortcuts->{$field_name};
@@ -409,16 +406,16 @@ sub apply_single_group_to_fields {
     my ($target_group_name) = @_;
     return unless $fieldspec{groups} && $fieldspec{fields};
     return unless exists $group_states{$target_group_name};
-    
+
     my $group_state = $group_states{$target_group_name};
-    
+
     # Apply this group's state to its fields only (skip hidden fields)
     for my $field_name (keys %{$fieldspec{fields}}) {
         my $field = $fieldspec{fields}->{$field_name};
         next if $field->{hidden};  # Skip hidden fields
-        
+
         my $field_groups = $field->{groups} // [];
-        
+
         if (grep { $_ eq $target_group_name } @$field_groups) {
             $field_states{$field_name} = $group_state;
         }
@@ -428,7 +425,7 @@ sub apply_single_group_to_fields {
 sub toggle_group {
     my ($group_name) = @_;
     return unless exists $group_states{$group_name};
-    
+
     $group_states{$group_name} = !$group_states{$group_name};
     apply_single_group_to_fields($group_name);  # Only apply this specific group
     set_debug("Toggled group '$group_name' to " . ($group_states{$group_name} ? 'ON' : 'OFF'));
@@ -437,7 +434,7 @@ sub toggle_group {
 sub toggle_field {
     my ($field_name) = @_;
     return unless exists $field_states{$field_name};
-    
+
     $field_states{$field_name} = !$field_states{$field_name};
     set_debug("Toggled field '$field_name' to " . ($field_states{$field_name} ? 'ON' : 'OFF'));
 }
@@ -593,12 +590,12 @@ sub get_config_key {
 
 sub update_field_stability {
     my ($new_names, $new_values) = @_;
-    
+
     my $config_key = get_config_key($new_names);
-    
+
     # Track this configuration
     $field_configs{$config_key}++;
-    
+
     # Clean up old configs if we have too many
     if (keys %field_configs > $max_recent_configs) {
         # Remove configs with lowest counts
@@ -608,7 +605,7 @@ sub update_field_stability {
             delete $field_configs{$to_remove};
         }
     }
-    
+
     # Check if this is the same as current config
     if ($config_key eq $current_config_key) {
         $config_stability_count++;
@@ -619,7 +616,7 @@ sub update_field_stability {
             # This config is stable enough, switch to it
             $current_config_key = $config_key;
             $config_stability_count = $field_configs{$config_key};
-            
+
             # Actually update the fields
             @field_names = @$new_names;
             $S = @field_names;
@@ -641,13 +638,13 @@ sub update_field_stability {
             return 0;  # no change
         }
     }
-    
+
     # Same config, just update values
     if (@field_names > 0) {  # only if we have established fields
         @values = @$new_values;
         return 1;  # indicate data was updated
     }
-    
+
     return 0;
 }
 
@@ -663,22 +660,22 @@ sub open_data_source {
     } elsif ($opt{stdin_mode}) {
         $data_source_type = 'stdin';
         $data_fh = *STDIN;
-        
+
         # Make stdin non-blocking
         my $flags = fcntl($data_fh, F_GETFL, 0) or die "fcntl F_GETFL on stdin: $!\n";
         fcntl($data_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL on stdin: $!\n";
-        
+
         set_debug("Reading data from stdin");
     } elsif ($opt{cmd}) {
         $data_source_type = 'cmd';
-        
+
         # Open command for reading
         open($data_fh, "-|", $opt{cmd}) or die "Cannot execute command '$opt{cmd}': $!\n";
-        
+
         # Make command pipe non-blocking
         my $flags = fcntl($data_fh, F_GETFL, 0) or die "fcntl F_GETFL on command pipe: $!\n";
         fcntl($data_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL on command pipe: $!\n";
-        
+
         set_debug("Reading data from command: $opt{cmd}");
     } else {
         # Default to serial port
@@ -690,59 +687,59 @@ sub open_data_source {
 sub open_serial_port {
     my $port = $opt{serial_port};
     my $baud = $opt{baud_rate};
-    
+
     # Configure the serial port using stty
     system("stty -F $port $baud cs8 -cstopb -parity raw -echo") == 0
         or die "Failed to configure serial port $port: $!\n";
-    
+
     # Open the serial port or file
     open($data_fh, '+<', $port) or die "Cannot open serial port $port: $!\n";
-    
+
     # Make it non-blocking
     my $flags = fcntl($data_fh, F_GETFL, 0) or die "fcntl F_GETFL: $!\n";
     fcntl($data_fh, F_SETFL, $flags | O_NONBLOCK) or die "fcntl F_SETFL: $!\n";
-    
+
     set_debug("Opened $port at $baud baud");
 }
 
 sub read_data_source {
     return unless $data_fh || $data_source_type eq 'demo';
     return if $data_source_type eq 'demo';  # Demo data generated elsewhere
-    
+
     my $data;
     my $bytes_read = sysread($data_fh, $data, 1024);
     return unless defined $bytes_read && $bytes_read > 0;
-    
+
     $data_buffer .= $data;
-    
+
     my @lines;
     while ($data_buffer =~ s/^([^\n]*)\n//) {
         my $line = $1;
         $line =~ s/\r//g;  # remove carriage returns
         push @lines, $line;
     }
-    
+
     return @lines;
 }
 
 sub send_serial_data {
     my ($data) = @_;
     return unless $serial_fh;
-    
+
     # Check if we're in a mode that supports sending
     if ($data_source_type ne 'serial') {
         set_debug("Send not supported in $data_source_type mode");
         return;
     }
-    
+
     # Add newline if not present
     $data .= "\n" unless $data =~ /\n$/;
-    
+
     eval {
         print $serial_fh $data;
         $serial_fh->flush() if $serial_fh->can('flush');
     };
-    
+
     if ($@) {
         set_debug("Send error: $@");
     } else {
@@ -752,10 +749,10 @@ sub send_serial_data {
 
 sub output_raw_line {
     my ($line) = @_;
-    
+
     # Convert tabs to two spaces
     $line =~ s/\t/  /g;
-    
+
     setup_raw_output_scroll();
     print gotorc($raw_output_bottom, 1);
     $line =~ s/\n$//;
@@ -764,7 +761,7 @@ sub output_raw_line {
 
 sub clear_raw_output_area {
     return unless $raw_output_active;
-    
+
     for my $r ($raw_output_top..$raw_output_bottom) {
         print gotorc($r, 1), a_raw_area() . clr_eol() . a_rst();
     }
@@ -811,10 +808,10 @@ sub parse_arduino_line {
     my ($line) = @_;
     chomp $line;
     $line =~ s/\s+$//;  # strip trailing whitespace
-    
+
     my @fields = split /\t/, $line;
     my (@names, @vals);
-    
+
     for my $i (0..$#fields) {
         my $field = $fields[$i];
         if ($field =~ /^([^: ]+):([+-]?(?:\d+\.?\d*|\.\d+))$/) {
@@ -829,37 +826,37 @@ sub parse_arduino_line {
             return ([],[]); # Return nothing on any invalid data
         }
     }
-    
+
     return (\@names, \@vals);
 }
 
 sub update_fields {
     my ($new_names, $new_values) = @_;
-    
+
     my $data_updated = update_field_stability($new_names, $new_values);
-    
+
     if ($data_updated && @field_names > 0) {
         # Update history
         for my $i (0..$S-1) {
             push @{$hist[$i]}, $values[$i];
             shift @{$hist[$i]} while @{$hist[$i]} > $hsize;
         }
-        
+
         # Recompute layout
         recompute_layout();
     }
-    
+
     return $data_updated;
 }
 
 sub recompute_layout {
     ($ROWS,$COLS) = term_size();
-    
+
     # Calculate dynamic layout requirements
     $legend_lines_needed = calculate_legend_lines_needed();
     $actual_footer_lines = calculate_footer_lines_needed();
     $actual_header_lines = $input_active ? 2 : 2;  # Extra line when input is active (Not right now)
-    
+
     # Reserve space for header, footer, and legend
     my $avail = $ROWS - $actual_header_lines - $actual_footer_lines - $legend_lines_needed;
     if ($avail < $min_plot_height) {
@@ -867,19 +864,19 @@ sub recompute_layout {
         my $min_legend = 1;
         $legend_lines_needed = $min_legend if $legend_lines_needed > $min_legend;
         $avail = $ROWS - $actual_header_lines - $actual_footer_lines - $legend_lines_needed;
-        
+
         # Reduce header if still not enough space
         if ($avail < $min_plot_height && !$input_active) {
             $actual_header_lines = 1;
             $avail = $ROWS - $actual_header_lines - $actual_footer_lines - $legend_lines_needed;
         }
-        
+
         die "Not enough vertical space (rows=$ROWS)\n" if $avail < $min_plot_height;
     }
-    
+
     $plot_top = $actual_header_lines + 1;
     $legend_start_row = $ROWS - $actual_footer_lines - $legend_lines_needed + 1;
-    
+
     if ($raw_output_active) {
         # Split available space between plot and raw output
         if ($raw_output_height == 0) {
@@ -887,19 +884,19 @@ sub recompute_layout {
             $raw_output_height = int($avail / 2);
             $raw_output_height = 3 if $raw_output_height < 3;  # minimum height
         }
-        
+
         # Ensure raw output doesn't exceed available space
         my $max_raw_height = $avail - 3;  # leave at least 3 lines for plot
         $raw_output_height = $max_raw_height if $raw_output_height > $max_raw_height;
         $raw_output_height = 3 if $raw_output_height < 3;
-        
+
         $raw_output_top = $plot_top;
         $raw_output_bottom = $raw_output_top + $raw_output_height - 1;
         $cur_plot_top = $raw_output_bottom + 1;
     } else {
         $cur_plot_top = $plot_top;
     }
-    
+
     $plot_bottom = $legend_start_row - 1;
     $plot_height = $plot_bottom - $plot_top + 1;
     $plot_left = $yaxis_w + $pad_left + 1;      # 1-based columns
@@ -921,7 +918,7 @@ sub val_to_col {
 # ---------------- Draw fixed bars ----------------
 sub draw_header {
     my $barbg = $a_header_bg;
-    
+
     # Row 1: Title and info
     print gotorc(1,1), $barbg, fg256(231), bold();
     my $mode = $opt{demo_mode} ? "DEMO" : "SERIAL";
@@ -930,7 +927,7 @@ sub draw_header {
     my $label = " Serial Data Plotter [$mode]$port_info$fieldspec_info ";
     $label = substr($label, 0, $COLS-1) if length($label) > $COLS-1;
     print $label, " " x ($COLS - 1 - length($label)), a_rst(), clr_eol();
-    
+
     # Row 2: Input line (when active) or empty
     print gotorc(2,1), $barbg, fg256(231);
     if ($input_active) {
@@ -938,7 +935,7 @@ sub draw_header {
         my $available_width = $COLS - 1 - length($prompt);
         my $display_buffer = $input_buffer;
         my $display_cursor = $input_cursor;
-        
+
         # Handle scrolling if input is too long
         if (length($display_buffer) > $available_width) {
             my $start_pos = $input_cursor - int($available_width * 0.8);
@@ -946,12 +943,12 @@ sub draw_header {
             $display_buffer = substr($input_buffer, $start_pos, $available_width);
             $display_cursor = $input_cursor - $start_pos;
         }
-        
+
         my $line = $prompt . $a_input . $display_buffer . $input_underscore;
         # Pad to full width
         # $line .= " " x ($COLS - 1 - length($line)) if length($line) < $COLS - 1;
         print $line . clr_eol();
-        
+
         # Position cursor
         my $cursor_col = length($prompt) + $display_cursor + 1;
         print gotorc(2, $cursor_col);
@@ -961,7 +958,7 @@ sub draw_header {
         print clr_eol();
         # print " " x ($COLS - 1), a_rst(), clr_eol();
     }
-    
+
     # Row 3: Empty (only when input is active)
     # Not using 3 lines for header. This was for when the input line was in the footer
     # if ($input_active) {
@@ -972,10 +969,10 @@ sub draw_header {
 
 sub highlight_field_name {
     my ($field_name, $shortcut, $is_enabled) = @_;
-    
+
     my $base_color = $is_enabled ? a_fieldname() : a_fieldname_disabled();
     return $base_color . $field_name  unless $shortcut;
-    
+
     # Highlight the shortcut character in the field name
     my $highlighted_name = $field_name;
     if ($highlighted_name =~ s/(\Q$shortcut\E)/a_hotkey() . $1 . ${base_color}/ei) {
@@ -990,35 +987,35 @@ sub highlight_field_name {
 # Calculate footer lines needed
 sub calculate_footer_lines_needed {
     my $lines = 1;  # Always need at least one line for controls
-    
+
     # Add line for debug message if present
     $lines++ if $debug_msg;
-    
+
     return $lines;
 }
 
 # Calculate how many lines we need for group legend
 sub calculate_group_lines_needed {
     return 0 unless %fieldspec && $fieldspec{groups};
-    
+
     # Get groups that have shortcuts assigned
     my @display_groups = grep { $group_shortcuts{$_} } keys %{$fieldspec{groups}};
     return 0 if @display_groups == 0;
-    
+
     # Calculate group display lengths more accurately
     my $total_length = 0;  # Start at 0, prefix already accounted for below
     my $available_width = $COLS - 2 - 8;  # Account for padding AND prefix
     my $lines = 1;
-    
+
     for my $group_name (@display_groups) {
         my $shortcut = $group_shortcuts{$group_name} // '';
-        
+
         # Calculate display text length more accurately (matching draw_legend logic)
         my $status_indicator = 1;  # "*" or " "
         my $shortcut_chars = $shortcut ? length($shortcut) + 2 : 0;  # "(x)" format
         my $padding = 3;  # spaces around text
         my $display_length = length($group_name) + $status_indicator + $shortcut_chars + $padding;
-        
+
         if ($total_length + $display_length > $available_width) {
             $lines++;
             $total_length = $display_length;  # Reset for new line
@@ -1026,7 +1023,7 @@ sub calculate_group_lines_needed {
             $total_length += $display_length;
         }
     }
-    
+
     return $lines;
 }
 
@@ -1034,11 +1031,11 @@ sub calculate_group_lines_needed {
 sub calculate_legend_lines_needed {
     my $group_lines = calculate_group_lines_needed();
     my $field_lines = 0;
-    
+
     if ($S == 0) {
         return $group_lines;  # Only groups, no fields yet
     }
-    
+
     # Get non-hidden fields for display
     my @display_fields;
     for my $i (0..$S-1) {
@@ -1046,7 +1043,7 @@ sub calculate_legend_lines_needed {
         next if is_field_hidden($field_name);  # Skip hidden fields
         push @display_fields, $i;
     }
-    
+
     if (@display_fields == 0) {
         $field_lines = 1;  # At least one line for "no fields to show"
     } else {
@@ -1054,22 +1051,22 @@ sub calculate_legend_lines_needed {
         my $total_length = 0;  # Start at 0, prefix already accounted for below
         my $available_width = $COLS - 2 - 8;  # Account for padding AND prefix
         $field_lines = 1;
-        
+
         for my $i (@display_fields) {
             my $field_name = $field_names[$i] // ($i + 1);
             my $config = get_field_config($field_name);
             my $shortcut = $field_shortcuts{$field_name} // '';
-            
+
             # Calculate display text length more accurately (matching draw_legend logic)
             my $glyph_length = 1;  # One character for glyph
             my $colon_space = 2;   # ": " after field name
             my $value_length = 8;  # Approximate value display length (-.--- to 1234.567)
             my $shortcut_chars = $shortcut ? length($shortcut) + 2 : 0;  # "(x)" format
             my $padding = 3;       # Spaces around the whole thing
-            
-            my $display_length = $glyph_length + length($field_name) + $colon_space + 
+
+            my $display_length = $glyph_length + length($field_name) + $colon_space +
                                $value_length + $shortcut_chars + $padding;
-            
+
             if ($total_length + $display_length > $available_width) {
                 $field_lines++;
                 $total_length = $display_length;  # Reset for new line
@@ -1078,43 +1075,43 @@ sub calculate_legend_lines_needed {
             }
         }
     }
-    
+
     return $group_lines + $field_lines;
 }
 
 sub draw_legend {
     return if $legend_lines_needed <= 0;
-    
+
     my $barbg = $a_legend_bg;
     my $current_row = $legend_start_row;
-    
+
     # Draw groups first
     my $group_lines = calculate_group_lines_needed();
     if ($group_lines > 0) {
-        my @display_groups = sort { 
-            ($fieldspec{groups}->{$a}->{order} // 999) <=> 
-            ($fieldspec{groups}->{$b}->{order} // 999) 
+        my @display_groups = sort {
+            ($fieldspec{groups}->{$a}->{order} // 999) <=>
+            ($fieldspec{groups}->{$b}->{order} // 999)
         } grep { $group_shortcuts{$_} } keys %{$fieldspec{groups}};
-        
+
         # Pre-calculate group display strings
         my @group_displays;
         for my $group_name (@display_groups) {
             my $is_enabled = $group_states{$group_name};
             my $shortcut = $group_shortcuts{$group_name} // '';
-            
+
             # Create highlighted group name
             my $highlighted_name = highlight_field_name($group_name, $shortcut, $is_enabled);
-            
+
             # Add status indicator
             my $status_indicator = $is_enabled ? "*" : " ";
-            
+
             # Build display text
             my $display_text = sprintf("%s%s  ", $highlighted_name, $status_indicator);
-            
+
             # Approximate length for layout
-            my $approx_length = length($group_name) + length($status_indicator) + 
+            my $approx_length = length($group_name) + length($status_indicator) +
                                ($shortcut ? length($shortcut) + 2 : 0) + 3;
-            
+
             push @group_displays, {
                 text => $display_text,
                 length => $approx_length,
@@ -1122,17 +1119,17 @@ sub draw_legend {
                 is_enabled => $is_enabled,
             };
         }
-        
+
         # Distribute groups across available lines
         my $current_group = 0;
-        
+
         for my $line_idx (0..$group_lines-1) {
             my $r = $current_row + $line_idx;
             print gotorc($r, 1), $barbg, fg256(231);
-            
+
             my $line_content = " ";
             my $available_width = $COLS - 2;  # Account for padding
-            
+
             if ($line_idx == 0) {
                 $line_content .= "Groups: ";
                 $available_width -= 8;  # "Groups: " = 8 chars
@@ -1140,32 +1137,32 @@ sub draw_legend {
                 $line_content .= "        ";  # Indent continuation lines
                 $available_width -= 8;
             }
-            
+
             my $current_line_length = 0;  # Prefix len already removed
-            
+
             # Add as many groups as will fit on this line
-            while ($current_group < @group_displays && 
+            while ($current_group < @group_displays &&
                    $current_line_length + $group_displays[$current_group]->{length} <= $available_width) {
-                
+
                 my $group = $group_displays[$current_group];
-                
+
                 # Add the group with proper color coding
                 my $color = $group->{is_enabled} ? fg256(231) : fg256(240);
                 $line_content .= $barbg . $color . $group->{text};
-                
+
                 $current_line_length += $group->{length};
                 $current_group++;
             }
-            
+
             # Pad the line to full width
             my $clean_content = $line_content;
             $clean_content =~ s/\e\[[0-9;]*m//g;
             my $padding_needed = $COLS - 1 - length($clean_content);
             $padding_needed = 0 if $padding_needed < 0;
             $line_content .= " " x $padding_needed;
-            
+
             print $line_content, a_rst(), clr_eol();
-            
+
             # If we've shown all groups, clear remaining group lines
             if ($current_group >= @group_displays) {
                 for my $remaining_line ($line_idx + 1..$group_lines-1) {
@@ -1176,13 +1173,13 @@ sub draw_legend {
                 last;
             }
         }
-        
+
         $current_row += $group_lines;
     }
-    
+
     # Draw fields
     return if $S == 0;  # No fields to draw
-    
+
     # Get non-hidden fields for display (both enabled and disabled)
     my @display_fields;
     for my $i (0..$S-1) {
@@ -1190,7 +1187,7 @@ sub draw_legend {
         next if is_field_hidden($field_name);  # Skip hidden fields only
         push @display_fields, $i;
     }
-    
+
     # Handle case where no fields are available for display
     if (@display_fields == 0) {
         my $r = $current_row;
@@ -1198,7 +1195,7 @@ sub draw_legend {
         my $msg = " No fields to display ";
         my $line = $msg . " " x ($COLS - 1 - length($msg));
         print $line, a_rst(), clr_eol();
-        
+
         # Clear remaining legend lines
         my $remaining_lines = $legend_lines_needed - $group_lines - 1;
         for my $remaining_line (1..$remaining_lines) {
@@ -1208,7 +1205,7 @@ sub draw_legend {
         }
         return;
     }
-    
+
     # Pre-calculate field display strings
     my @field_displays;
     for my $i (@display_fields) {
@@ -1217,7 +1214,7 @@ sub draw_legend {
         my $is_enabled = is_field_enabled($field_name);
         my $g = $config->{ch} // $glyphs[$i % @glyphs];
         my $shortcut = $field_shortcuts{$field_name} // '';
-        
+
         my $value_str;
         if (defined $values[$i]) {
             # Format numbers based on magnitude for better display
@@ -1234,22 +1231,22 @@ sub draw_legend {
         } else {
             $value_str = "-.---";
         }
-        
+
         # Create highlighted field name
         my $highlighted_name = highlight_field_name($field_name, $shortcut, $is_enabled);
-        
+
         # Add OFF indicator for disabled fields
         # my $status_indicator = $is_enabled ? "" : " [OFF]"; # Takes up too much space
         my $status_indicator = '';
-        
+
         # Build display text with glyph and value
         my $display_text = sprintf("%s %s:%s%s  ", $g, $highlighted_name, $value_str, $status_indicator);
-        
+
         # Approximate length for layout (ignoring color codes)
-        my $approx_length = length($g) + 1 + length($field_name) + 1 + length($value_str) + 
+        my $approx_length = length($g) + 1 + length($field_name) + 1 + length($value_str) +
                            ($shortcut ? length($shortcut) + 2 : 0) + 3;
                            # ($is_enabled ? 0 : 6) + 3;  # 6 for " [OFF]" takes too much space
-        
+
         # Determine color from field config or default
         my $color;
         my $is_rgb = 0;
@@ -1264,7 +1261,7 @@ sub draw_legend {
             # Default color
             $color = $colors[$i % @colors];
         }
-        
+
         # Dim color for disabled fields
         if (!$is_enabled && !$is_rgb) {
             # For 256-color, use a dimmed version
@@ -1273,7 +1270,7 @@ sub draw_legend {
             # For RGB, dim by reducing all components
             $color = [map { int($_ * 0.5) } @$color];
         }
-        
+
         push @field_displays, {
             text => $display_text,
             length => $approx_length,
@@ -1283,18 +1280,18 @@ sub draw_legend {
             is_enabled => $is_enabled,
         };
     }
-    
+
     # Distribute fields across remaining available lines
     my $field_lines = $legend_lines_needed - $group_lines;
     my $current_field = 0;
-    
+
     for my $line_idx (0..$field_lines-1) {
         my $r = $current_row + $line_idx;
         print gotorc($r, 1), $barbg, fg256(231);
-        
+
         my $line_content = " ";
         my $available_width = $COLS - 2;  # Account for padding
-        
+
         if ($line_idx == 0) {
             $line_content .= "Fields: ";
             $available_width -= 8;  # "Fields: " = 8 chars
@@ -1302,15 +1299,15 @@ sub draw_legend {
             $line_content .= "        ";  # Indent continuation lines
             $available_width -= 8;
         }
-        
+
         my $current_line_length = 0;  # "Fields:" len already removed
-        
+
         # Add as many fields as will fit on this line
-        while ($current_field < @field_displays && 
+        while ($current_field < @field_displays &&
                $current_line_length + $field_displays[$current_field]->{length} <= $available_width) {
-            
+
             my $field = $field_displays[$current_field];
-            
+
             # Add the field with proper color coding for the glyph
             my $color_code;
             if ($field->{is_rgb}) {
@@ -1318,24 +1315,24 @@ sub draw_legend {
             } else {
                 $color_code = fg256($field->{color});
             }
-            
+
             # Get the actual display text and add glyph coloring
             my $display = $field->{text};
             if ($display =~ /^(\S+) (.+)$/) {
                 my ($glyph, $rest) = ($1, $2);
-                $line_content .= $barbg . $color_code . $glyph . 
+                $line_content .= $barbg . $color_code . $glyph .
                                $barbg . fg256(231) . " " . $rest;
-                # $line_content .= a_rst() . $color_code . $glyph . 
+                # $line_content .= a_rst() . $color_code . $glyph .
                 #                a_rst() . bg256($barbg) . fg256(231) . " " . $rest;
             } else {
                 $line_content .= $barbg . fg256(231) . $display;
                 # $line_content .= a_rst() . bg256($barbg) . fg256(231) . $display;
             }
-            
+
             $current_line_length += $field->{length};
             $current_field++;
         }
-        
+
         # Pad the line to full width
         my $padding_needed = $COLS - 1 - length($line_content);
         # Calculate padding more accurately by removing ANSI codes
@@ -1344,9 +1341,9 @@ sub draw_legend {
         $padding_needed = $COLS - 1 - length($clean_content);
         $padding_needed = 0 if $padding_needed < 0;
         $line_content .= " " x $padding_needed;
-        
+
         print $line_content, a_rst(), clr_eol();
-        
+
         # If we've shown all fields, clear remaining legend lines
         if ($current_field >= @field_displays) {
             for my $remaining_line ($line_idx + 1..$field_lines-1) {
@@ -1362,12 +1359,12 @@ sub draw_legend {
 sub draw_footer {
     return if $actual_footer_lines <= 0;
     my $barbg = $a_footer_bg;
-    
+
     for my $i (0..$actual_footer_lines-1) {
         my $r = $ROWS - $actual_footer_lines + 1 + $i;
         print gotorc($r,1), $barbg, fg256(231), bold();
         my $label = "";
-        
+
         if ($i == 0) {
             my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw output";
             my $raw_resize = $raw_output_active ? " +/-=resize" : "";
@@ -1376,7 +1373,7 @@ sub draw_footer {
         } elsif ($i == 1 && $debug_msg) {
             $label = $debug_msg;
         }
-        
+
         # Ensure label doesn't exceed terminal width
         $label = substr($label, 0, $COLS - 1) if length($label) > $COLS - 1;
         my $padding = $COLS - 1 - length($label);
@@ -1397,11 +1394,11 @@ sub full_redraw {
     reset_scroll_region();
     clear_screen();
     set_debug("Redraw (plot:$cur_plot_top-$plot_bottom) (Line: $need_redraw_line, Reason: $need_redraw_msg)");
-    
+
     draw_header();
     draw_legend();
     draw_footer();
-    
+
     if ($raw_output_active) {
         clear_raw_output_area();
     }
@@ -1430,20 +1427,20 @@ sub step_series_demo {
 sub build_plot_row {
     my ($vmin, $vmax) = @_;
     return "" if $S == 0;  # No data yet
-    
+
     my $width = $plot_width;
     my @buf = (' ') x $COLS;
-    
+
     # draw series points (only for enabled and non-hidden fields)
     for my $i (0..$S-1) {
         my $field_name = $field_names[$i] // ($i + 1);
         next if is_field_hidden($field_name);   # Skip hidden fields
         next unless is_field_enabled($field_name);  # Skip disabled fields
-        
+
         my $col = val_to_col($values[$i], $vmin, $vmax);
         my $config = get_field_config($field_name);
         my $glyph = $config->{ch} // $glyphs[$i % @glyphs];
-        
+
         # Determine color from field config or default
         my $color_code;
         if ($config->{fg24}) {
@@ -1453,7 +1450,7 @@ sub build_plot_row {
         } else {
             $color_code = fg256($colors[$i % @colors]);
         }
-        
+
         if ($col >= 1 && $col <= $COLS) {
             # place only inside plot area; other cols remain spaces
             if ($col >= $plot_left && $col <= $plot_right) {
@@ -1470,19 +1467,19 @@ sub build_plot_row {
             }
         }
     }
-    
+
     # optional subtle left/right borders for the plot area
     my $border_col = 244;
     # Left border: one column before plot area
     if ($plot_left-1 >= 1) {
         $buf[$plot_left-2] = fg256($border_col) . '│' . a_rst();
     }
-    # Right border: one column after plot area  
+    # Right border: one column after plot area
     my $right_border_col = $plot_right + 1;
     if ($right_border_col <= $COLS) {
         $buf[$right_border_col-1] = fg256($border_col) . '│' . a_rst();
     }
-    
+
     # Return the visible line covering the whole width
     return join('', @buf[0..$COLS-1]);
 }
@@ -1493,7 +1490,7 @@ sub window_minmax {
         my $field_name = $field_names[$i] // ($i + 1);
         next if is_field_hidden($field_name);    # Skip hidden fields
         next unless is_field_enabled($field_name);  # Skip disabled fields
-        
+
         for my $v (@{$hist[$i]}) {
             $lo = $v if $v < $lo;
             $hi = $v if $v > $hi;
@@ -1656,8 +1653,8 @@ while (1) {
             # Arrow keys and other special handling could go here
         } else {
             # Handle normal mode
-            if ($key eq 'q') { 
-                last; 
+            if ($key eq 'q') {
+                last;
             } elsif ($key eq 'N') {
                 $inline_nums_on = !$inline_nums_on;
             } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
@@ -1713,12 +1710,12 @@ while (1) {
             }
         }
     }
-    
+
     if ($need_redraw) {
         full_redraw();
         $need_redraw = 0;
     }
-    
+
     # Read and process data
     my $data_updated = 0;
     if ($data_source_type eq 'demo') {
@@ -1728,7 +1725,7 @@ while (1) {
         my @lines = read_data_source();
         for my $line (@lines) {
             next if $line =~ /^\s*$/;  # Skip empty lines
-            
+
             # Try to parse as plot data first
             my ($names, $values) = parse_arduino_line($line);
             if (@$names > 0) {
@@ -1745,7 +1742,7 @@ while (1) {
             }
         }
     }
-    
+
     # Only plot if we have data, it was updated, and at least one field is enabled
     if ($data_updated && $S > 0) {
         # Check if any fields are enabled
@@ -1757,7 +1754,7 @@ while (1) {
                 last;
             }
         }
-        
+
         if ($any_enabled) {
             my ($vmin,$vmax) = window_minmax();
             # Build one row and print it at bottom of scroll region
@@ -1765,7 +1762,7 @@ while (1) {
             setup_plot_output_scroll();
             print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
         }
-        
+
         # Update legend periodically to avoid interference with scrolling
         $legend_update_counter++;
         my $update_legend = $need_redraw || ($legend_update_counter % 10 == 0);  # Every 10th update
@@ -1773,7 +1770,7 @@ while (1) {
             draw_legend();
         }
     }
-    
+
     Time::HiRes::sleep($sleep_s) if $sleep_s > 0;
 }
 
