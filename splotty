@@ -25,6 +25,8 @@ use Time::HiRes qw(gettimeofday);
 use POSIX qw(strftime);
 use Data::Dumper;
 use List::Util 'shuffle';
+use File::Spec;
+
 binmode STDOUT, ':encoding(UTF-8)';
 
 # ---------------- CLI ----------------
@@ -645,6 +647,67 @@ sub update_field_stability {
     }
 
     return 0;
+}
+
+sub write_fieldspec_template {
+    return if $S == 0;  # No fields to write
+    
+    my $tmpdir = File::Spec->tmpdir();
+    my $timestamp = strftime("%H%M%S", localtime);
+    my $filename = File::Spec->catfile($tmpdir, "splotty-fields-$timestamp.yaml");
+    
+    # Build a minimal fieldspec structure
+    my %spec = (
+        defaults => {
+            fields => {
+                #key_auto => 1,
+            }
+        },
+        state => {
+            start => 1,
+        },
+        fields => {},
+    );
+    
+    # Add each field
+    for my $i (0..$S-1) {
+        my $field_name = $field_names[$i] // ($i + 1);
+        next if is_field_hidden($field_name);  # Skip hidden fields
+        
+        my $config = get_field_config($field_name);
+        
+        # Build field entry
+        my %field_entry = (
+            key => 'auto',
+        );
+        
+        # Include current glyph and color if different from defaults
+        my $default_glyph = $glyphs[$i % @glyphs];
+        my $default_color = $colors[$i % @colors];
+        my $current_glyph = $config->{ch} // $default_glyph;
+        my $current_color = $config->{fg} // $default_color;
+        
+        $field_entry{ch} = $current_glyph if $current_glyph ne $default_glyph;
+        $field_entry{fg} = $current_color if $current_color != $default_color;
+        
+        # Add RGB color if present
+        if ($config->{fg24}) {
+            $field_entry{fg24} = $config->{fg24};
+            delete $field_entry{fg};  # Remove 256-color if RGB is present
+        }
+        
+        $spec{fields}{$field_name} = \%field_entry;
+    }
+    
+    # Write the file
+    eval {
+        DumpFile($filename, \%spec);
+        set_debug("Wrote fieldspec template to: $filename");
+    };
+    
+    if ($@) {
+        set_debug("Failed to write fieldspec: $@");
+    }
 }
 
 # ---------------- Serial Data ----------------
@@ -1412,7 +1475,7 @@ sub draw_footer {
             my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw panel";
             my $raw_resize = $raw_output_active ? " +/-=resize" : "";
             my $shortcuts_info = %fieldspec ? " [fld/grp keys active]" : "";
-            $label = " q=quit N=toggle numbers ^T=Term.input$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs";
+            $label = " q=quit N=toggle numbers ^T=Term.input$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs ^W:Wr.Fields";
         } elsif ($i == 1 && $debug_msg) {
             $label = $debug_msg;
         }
@@ -1431,6 +1494,7 @@ sub clear_screen { print esc("2J") }
 
 sub set_debug($msg) {
     $debug_msg = sprintf(" DEBUG[%d] $msg ", time()%1000);
+    draw_footer();
 }
 
 sub full_redraw {
@@ -1659,7 +1723,7 @@ while (1) {
             if ($ord_ch == 20) {  # ^t (CTRL+t)
                 $input_active = 0;
                 draw_header();
-            } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
+            } elsif ($ord_ch == 20) {  # ^T (CTRL+t) # Terminal/serial line input
                 # Check if input mode is supported
                 if ($data_source_type ne 'serial') {
                     set_debug("Terminal input (^T) only available in serial mode");
@@ -1704,6 +1768,8 @@ while (1) {
                 last;
             } elsif ($key eq 'N') {
                 $inline_nums_on = !$inline_nums_on;
+            } elsif ($ord_ch == 23) {  # ^W (CTRL+W) # Write fieldspec template
+                write_fieldspec_template();
             } elsif ($ord_ch == 25) {  # ^Y (CTRL+y)
                 @colors = shuffle @colors;
             } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
@@ -1756,6 +1822,8 @@ while (1) {
                 toggle_field($shortcut_to_field{$key});
                 # recompute_layout();  # Recalculate in case legend size changed
                 # $need_redraw = 1;
+            } else {
+                set_debug("Unknown key hit ord:$ord_ch");
             }
         }
     }
