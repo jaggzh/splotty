@@ -116,8 +116,8 @@ GetOptions(
     'window=i'      => \$opt{window},
     'delay_ms|d=i'  => \$opt{delay_ms},
     'no-color!'     => \$opt{no_color},
-    'serial-port=s' => \$opt{serial_port},
-    'baud-rate=i'   => \$opt{baud_rate},
+    'serial-port|p=s' => \$opt{serial_port},
+    'baud-rate|r=i'   => \$opt{baud_rate},
     'demo!'         => \$opt{demo_mode},
     'stdin!'        => \$opt{stdin_mode},
     'cmd=s'         => \$opt{cmd},
@@ -159,6 +159,80 @@ my %shortcut_to_group = ();  # Reverse mapping: shortcut -> group name
 my $fieldspec_path = '';     # Resolved path to current fieldspec
 my $input_underscore = '🥕';
 
+# ---------------- Layout state ----------------
+my ($ROWS, $COLS) = term_size();
+my $need_redraw = 1;       # trigger full redraw
+my $need_redraw_msg = '';  # Reason for redraw
+my $need_redraw_line = 0;  # Line of redraw requester
+my $inline_nums_on = 0;  # toggle with 'N' to show/hide per-glyph sensor numbers
+my $min_plot_height = 6;
+my $debug_msg = "";      # debug message for footer
+my $input_active = 0;    # whether terminal input line is active
+my $input_buffer = "";   # current input buffer
+my $input_cursor = 0;    # cursor position in input buffer
+
+# Layout calculations
+my ($actual_header_lines, $actual_footer_lines, $legend_lines_needed);
+my ($plot_top, $plot_bottom, $plot_height, $plot_left, $plot_right, $plot_width);
+my ($legend_start_row);
+my $raw_output_active = 0;  # whether raw serial output area is active
+my $raw_output_height = 0;  # height of raw output area
+my $raw_output_top = 0;     # top row of raw output area
+my $raw_output_bottom = 0;  # bottom row of raw output area
+my @plot_data_buffer = ();  # buffer plot data when raw output is active
+
+# gutters
+my $yaxis_w   = 0;       # pure char plotting; no X/Y axes in the scroller row lines
+my $pad_left  = 1;       # small left pad
+my $pad_right = 1;       # small right pad
+
+# glyphs/colors
+# my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
+# my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
+my @glyphs = (
+    '●','◆','■','▲','○','◇','□','△','▣','✶','✦','▸','◼','▴',
+    '♦','♠','♣','♥','★','☆','◉','◎','⬢','⬡','⬣','⬤','⬟','⚬','◘','◙',
+    '±','∞','∆','∇','※','‡','†','¤','⊙','⊚','⊛','⊜','⊝','⊞','⊟',
+    '►','◄','▼','▶','◊','╳','╬','┼','▪','▫','▬','▭','▮','▯','▰','▱',
+    '⟐','⟡','♪','♫','⌘','⊠','⊡','⟢','⟣','⟤','⟥','⟦','⟧','◣',
+    '◤','◥','◢','◐','◑','◒','◓','⬰','⬱','⬲','⬳','⭘','⭙','⭚','⭛','⭜'
+);
+
+my @colors = (
+    196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160,
+    124,197,198,202,203,209,210,211,
+    46,47,48,76,82,83,118,154,156,191,192,
+    12,19,20,21,26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
+    11,184,221,222,226,227,228,
+    135,165,171,177,207,213,219,225,
+    14,50,86,87,122,158,195,97
+);
+
+# ---------------- Data ----------------
+my $S = $opt{series};
+my @values;          # current values (length S)
+my @field_names;     # field names for each series
+my @hist;            # history ring buffers per series (array of arrayrefs)
+my $hsize = $opt{window};
+
+# For demo mode - keep the original random data
+my @start = map { 50 + rand()*50 } (1..$S);
+my @vol   = map { 6 + rand()*6 }   (1..$S);
+
+# ---------------- Field Stability System ----------------
+my %field_configs;       # track different field configurations
+my $current_config_key = "";
+my $config_stability_count = 0;
+my $min_stability_count = 3;  # need to see config this many times before changing
+my $max_recent_configs = 10;   # keep track of recent configs
+
+my $cleaned = 0; # Clean-up flag for shutting down
+
+my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
+my $legend_update_counter = 0;
+# Open keyboard input source based on mode
+my $kb_input_fh;
+
 sub millis() {
     my ($s, $usec) = gettimeofday();
     my $ms = $s*1000 + int($usec/1000);
@@ -189,6 +263,20 @@ sub load_state {
     eval {
         my $state = LoadFile($state_file);
 
+        # Load last used serial settings if not specified on command line
+        if ($state->{last_state}) {
+            if (!defined $ARGV[0] || !grep { /--serial-port/ } @ARGV) {
+                if ($state->{last_state}->{serial_port}) {
+                    $opt{serial_port} = $state->{last_state}->{serial_port};
+                }
+            }
+            if (!grep { /--baud-rate/ } @ARGV) {
+                if ($state->{last_state}->{baud_rate}) {
+                    $opt{baud_rate} = $state->{last_state}->{baud_rate};
+                }
+            }
+        }
+
         # Load last used fieldspec if no fieldspec specified
         if (!$opt{fieldspec} && $state->{last_state} && $state->{last_state}->{fieldspec_path}) {
             $opt{fieldspec} = $state->{last_state}->{fieldspec_path};
@@ -205,19 +293,18 @@ sub load_state {
 }
 
 sub save_state {
-    return unless $fieldspec_path;
-
     get_config_dir();  # Ensure directory exists
     my $state = {};
-    if (defined $fieldspec_path) {
-        $state = {
-            last_state => {
-                fieldspec_path => $fieldspec_path,
-                groups => \%group_states,
-                fields => \%field_states,
-            }
-        };
-    }
+
+    $state = {
+        last_state => {
+            fieldspec_path => $fieldspec_path,
+            groups => \%group_states,
+            fields => \%field_states,
+            serial_port => $opt{serial_port},
+            baud_rate => $opt{baud_rate},
+        }
+    };
 
     eval {
         DumpFile($state_file, $state);
@@ -291,7 +378,7 @@ sub load_fieldspec {
             swarn($err);
         }
         if ($opt{wipe}) {
-            $fieldspec_path = undef;
+            $fieldspec_path = '';
             save_state();
             swarn("Wiped.");
             exit 0;
@@ -347,6 +434,15 @@ sub assign_auto_shortcuts {
             if (($field->{key} // '') eq 'auto') {
                 push @auto_fields, $field_name;
             }
+        }
+    }
+
+    # Also include field_names that aren't in fieldspec at all (dynamic fields)
+    for my $field_name (@field_names) {
+        next if is_field_hidden($field_name);  # Skip hidden fields
+        # If field isn't in fieldspec, it needs auto-assignment
+        if (!exists $fieldspec{fields} || !exists $fieldspec{fields}->{$field_name}) {
+            push @auto_fields, $field_name unless grep { $_ eq $field_name } @auto_fields;
         }
     }
 
@@ -512,74 +608,6 @@ sub term_size {
     return ($rows,$cols);
 }
 
-# ---------------- Layout state ----------------
-my ($ROWS, $COLS) = term_size();
-my $need_redraw = 1;       # trigger full redraw
-my $need_redraw_msg = '';  # Reason for redraw
-my $need_redraw_line = 0;  # Line of redraw requester
-my $inline_nums_on = 0;  # toggle with 'N' to show/hide per-glyph sensor numbers
-my $min_plot_height = 6;
-my $debug_msg = "";      # debug message for footer
-my $input_active = 0;    # whether terminal input line is active
-my $input_buffer = "";   # current input buffer
-my $input_cursor = 0;    # cursor position in input buffer
-
-# Layout calculations
-my ($actual_header_lines, $actual_footer_lines, $legend_lines_needed);
-my ($plot_top, $plot_bottom, $plot_height, $plot_left, $plot_right, $plot_width);
-my ($legend_start_row);
-my $raw_output_active = 0;  # whether raw serial output area is active
-my $raw_output_height = 0;  # height of raw output area
-my $raw_output_top = 0;     # top row of raw output area
-my $raw_output_bottom = 0;  # bottom row of raw output area
-my @plot_data_buffer = ();  # buffer plot data when raw output is active
-
-# gutters
-my $yaxis_w   = 0;       # pure char plotting; no X/Y axes in the scroller row lines
-my $pad_left  = 1;       # small left pad
-my $pad_right = 1;       # small right pad
-
-# glyphs/colors
-# my @glyphs = ('●','◆','■','▲','○','◇','□','△','▣','▵','✶','✦','▸','◆','◼','▴');
-# my @colors = (196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160);
-my @glyphs = (
-    '●','◆','■','▲','○','◇','□','△','▣','✶','✦','▸','◼','▴',
-    '♦','♠','♣','♥','★','☆','◉','◎','⬢','⬡','⬣','⬤','⬟','⚬','◘','◙',
-    '±','∞','∆','∇','※','‡','†','¤','⊙','⊚','⊛','⊜','⊝','⊞','⊟',
-    '►','◄','▼','▶','◊','╳','╬','┼','▪','▫','▬','▭','▮','▯','▰','▱',
-    '⟐','⟡','♪','♫','⌘','⊠','⊡','⟢','⟣','⟤','⟥','⟦','⟧','◣',
-    '◤','◥','◢','◐','◑','◒','◓','⬰','⬱','⬲','⬳','⭘','⭙','⭚','⭛','⭜'
-);
-
-my @colors = (
-    196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160,
-    124,197,198,202,203,209,210,211,
-    46,47,48,76,82,83,118,154,156,191,192,
-    12,19,20,21,26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
-    11,184,221,222,226,227,228,
-    135,165,171,177,207,213,219,225,
-    14,50,86,87,122,158,195,97
-);
-
-
-# ---------------- Data ----------------
-my $S = $opt{series};
-my @values;          # current values (length S)
-my @field_names;     # field names for each series
-my @hist;            # history ring buffers per series (array of arrayrefs)
-my $hsize = $opt{window};
-
-# For demo mode - keep the original random data
-my @start = map { 50 + rand()*50 } (1..$S);
-my @vol   = map { 6 + rand()*6 }   (1..$S);
-
-# ---------------- Field Stability System ----------------
-my %field_configs;       # track different field configurations
-my $current_config_key = "";
-my $config_stability_count = 0;
-my $min_stability_count = 3;  # need to see config this many times before changing
-my $max_recent_configs = 10;   # keep track of recent configs
-
 sub set_need_redraw($msg, $lineno=undef) {
     my ($package, $filename, $line) = caller();
     $need_redraw_msg = $msg;
@@ -626,6 +654,29 @@ sub update_field_stability {
             $S = @field_names;
             @values = @$new_values;
             @hist = map { [] } (0..$S-1);
+
+            # Initialize field states for new fields (if not already set)
+            for my $field_name (@field_names) {
+                next if exists $field_states{$field_name};  # Already has state
+                my $start_state = 1;  # Default to enabled
+                if (%fieldspec && $fieldspec{state} && exists $fieldspec{state}->{start}) {
+                    $start_state = $fieldspec{state}->{start};
+                }
+                $field_states{$field_name} = $start_state;
+            }
+
+            # Re-assign shortcuts for all fields (including new dynamic fields)
+            my %manual_field_shortcuts;
+            if ($fieldspec{fields}) {
+                for my $field_name (keys %{$fieldspec{fields}}) {
+                    my $field = $fieldspec{fields}->{$field_name};
+                    next if $field->{hidden};
+                    if ($field->{key} && $field->{key} ne 'auto') {
+                        $manual_field_shortcuts{$field_name} = $field->{key};
+                    }
+                }
+            }
+            assign_auto_shortcuts(\%manual_field_shortcuts);
 
             # Determine if we can avoid redrawing the whole screen
             my $legend_line_count_new = calculate_legend_lines_needed();
@@ -686,11 +737,11 @@ sub write_fieldspec_template {
         #     hidden: true
         #     key_auto: false
         EOT
-    
+
     my $tmpdir = File::Spec->tmpdir();
     my $timestamp = strftime("%H%M%S", localtime);
     my $filename = File::Spec->catfile($tmpdir, "splotty-fields-$timestamp.yaml");
-    
+
     # Build a minimal fieldspec structure
     my %spec = (
         defaults => {
@@ -703,45 +754,45 @@ sub write_fieldspec_template {
         },
         fields => {},
     );
-    
+
     # Add each field
     for my $i (0..$S-1) {
         my $field_name = $field_names[$i] // ($i + 1);
         next if is_field_hidden($field_name);  # Skip hidden fields
-        
+
         my $config = get_field_config($field_name);
-        
+
         # Build field entry
         my %field_entry = (
             # key => 'auto',
             groups => ['All'],
         );
-        
+
         # Include current glyph and color if different from defaults
         my $default_glyph = $glyphs[$i % @glyphs];
         my $default_color = $colors[$i % @colors];
         my $current_glyph = $config->{ch} // $default_glyph;
         my $current_color = $config->{fg} // $default_color;
-        
+
         $field_entry{ch} = $current_glyph if $current_glyph ne $default_glyph;
         $field_entry{fg} = $current_color if $current_color != $default_color;
-        
+
         # Add RGB color if present
         if ($config->{fg24}) {
             $field_entry{fg24} = $config->{fg24};
             delete $field_entry{fg};  # Remove 256-color if RGB is present
         }
-        
+
         $spec{fields}{$field_name} = \%field_entry;
     }
-    
+
     # Write the file
     eval {
         my $yaml = Dump(\%spec);
         write_text($filename, "$header$yaml");
         set_debug("Wrote fieldspec template to: $filename");
     };
-    
+
     if ($@) {
         set_debug("Failed to write fieldspec: $@");
     }
@@ -884,47 +935,46 @@ sub setup_plot_output_scroll {
 
 sub replay_history {
     return if $S == 0;  # No data yet
-    
+
     # Find the minimum history depth across all series
     my $history_depth = 0;
     for my $i (0..$S-1) {
         my $depth = scalar @{$hist[$i]};
         $history_depth = $depth if $history_depth == 0 || $depth < $history_depth;
     }
-    
+
     return if $history_depth == 0;  # No history to replay
-    
+
     # Replay min(history_depth, plot_height) rows
     my $rows_to_replay = $history_depth < $plot_height ? $history_depth : $plot_height;
     my $start_idx = $history_depth - $rows_to_replay;
-    
+
     # Calculate range for the entire history we're replaying
     my ($vmin, $vmax) = window_minmax();
-    
+
     # Temporarily disable scrolling to place rows directly
     reset_scroll_region();
-    
+
     # Save current values
     my @saved_values = @values;
-    
+
     for my $row_idx (0..$rows_to_replay-1) {
         my $hist_idx = $start_idx + $row_idx;
         my $screen_row = $cur_plot_top + $row_idx;
-        
+
         # Set values to this historical point
         for my $i (0..$S-1) {
             $values[$i] = $hist[$i]->[$hist_idx] if $hist_idx < @{$hist[$i]};
         }
-        
+
         my $row = build_plot_row($vmin, $vmax);
         print gotorc($screen_row, 1), $row, clr_eol();
     }
-    
+
     # Restore current values and scrolling
     @values = @saved_values;
     setup_plot_output_scroll();
 }
-
 
 sub init_data {
     if ($data_source_type eq 'demo') {
@@ -952,7 +1002,7 @@ sub parse_arduino_line {
     chomp $line;
     $line =~ s/\s+$//;  # strip trailing whitespace
 
-    my @fields = split /\t/, $line;
+    my @fields = split /\s+/, $line;
     my (@names, @vals);
 
     for my $i (0..$#fields) {
@@ -1648,7 +1698,6 @@ sub window_minmax {
 # ---------------- Main ----------------
 $| = 1;
 hide_cursor();
-my $cleaned = 0;
 
 sub cleanup {
     return if $cleaned;
@@ -1696,15 +1745,8 @@ unless ($opt{demo_mode}) {
 # Initial layout & draw
 recompute_layout();
 full_redraw();
-set_raw_tty();
+set_raw_tty(); # Nonblocking input
 
-# Nonblocking input + main loop
-my $sleep_s = ($opt{delay_ms} // 0) / 1000.0;
-
-my $legend_update_counter = 0;
-
-# Open keyboard input source based on mode
-my $kb_input_fh;
 if ($opt{stdin_mode}) {
     # When reading data from stdin, get keyboard from /dev/tty
     open($kb_input_fh, "<", "/dev/tty") || die "Can't open /dev/tty: $!";
