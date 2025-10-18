@@ -64,11 +64,12 @@ OPTIONS:
     --footer=N          Minimum footer lines (calculated dynamically)
     --series=N          Initial number of series (default: 4, auto-detected)
     --window=N          Autorange window in rows (default: 30)
-    --delay_ms=N        Inter-row delay in milliseconds (default: 0)
-    --no-color          Disable color output
-    --serial-port=PATH  Serial port path (default: /dev/ttyACM1)
-    --baud-rate=N       Baud rate (default: 115200)
-    --fieldspec=FILE    Load field specification YAML file
+    --delay_ms=N         Inter-row delay in milliseconds (default: 0)
+    --no-color            Disable color output
+    --serial-port|-p=PATH  Serial port path (default: /dev/ttyACM1)
+                           (Stored for next run in ~/.config/splotty/state.yaml)
+    --baud-rate|-r=N      Baud rate (default: 115200)
+    --fieldspec=FILE     Load field specification YAML file
     -f FILE             Short form of --fieldspec
     --wipe              Wipe stored fieldspec path
     --force             Force run, ignoring a bad fieldspec path
