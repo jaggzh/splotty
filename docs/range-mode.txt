@@ -1,0 +1,75 @@
+# Splotty plot boundary settings
+
+Ideas and discussion on initial implementation of auto-ranging/scaling so presently useless values can be scaled to a viewable size.
+Groups and stuff can come later.
+My initial ideas for an initial implementation which requires nothing but the user to toggle the feature on:
+  1. a tiered logarithmic clustering?
+  2. Auto-ranging of each field (each one just normalized normalized)
+  3. User enables normalization, but can increase the count of clusters
+  * Without axes values?
+  * or Ranged values displayed as the first (top) line of the plot?
+
+  Can the scaling method be modularized, so fields and their meta data are
+  either passed to or managed by the module, and the module enables/disabled
+  core features in the main script, each of which may or may not be used by whatever type of scaling/ranging/normalization is enabled.
+
+
+## Background:
+Text-based serial data plotter for effectively unlimited number-of-fields serial/data plots, allowing tabular data as plain numerical, or labeled like arduino:#.##  lbl2:#  etc.
+The plotter also supports field groups (named-collections defined in a yaml), presently used to toggle visibility.
+
+Being text-based, I only implemented vertical scrolling.
+At present, the entire plot just auto-ranges to the min/max plots. (tbh I didn't even look at how it was implemented; the llm might have followed some idea I had on a very slow moving assymetric min/max (fast growth, slow shrink).
+
+
+## New bounds feature(s) - General idea:
+A. Need a toggle to normalize all plots.
+B. I need to know some methods used for setting ranges for the scaling/bounds of the plot. These will be toggled with a prefix hotkey (r)anges, perhaps like r-0 for all; we need to keep in mind that whatever fixed letters we use, we're consuming one that might be used for existing plots or field-groups.
+
+I need to know, in the industry, what methods are used for actually handling the range calculations, adjustments, and groupings, to know "what others have done" (and then do it right). (As an example, Arduino's just normalizes instantly to the min/max of whatever data is in the view (and it's awfully limited as a result, and awkwardly flickers the scale); yet, slow-shrinking ranges are confusing as the plot scale "glides" and you visually see the plot changing, but it's hard to differentiate if it's the plot or the ranges doing it.
+
+C. Logarithmic Tiered:
+	What about a tiered logarithmic plot, where the plots are automatically classified into powers with stickiness. I've never done this, but I think it would have submodes.
+	C.1. Fixed display range. Plots overlap.
+
+Functionalities we likely need implemented, in part:
+1. In-TUI management of field-groups and the fields in them.
+2. Range groups (ie 'range fieldgroups'): All plots within a group are subject to the same range/scale.
+2.a. The user should be able to toggle existing field groups' auto-range functionality and [depending on what we come up with from (B)], the method used. 'r' key should probably switch to "Range-Setting" mode, where the display might be slightly different, for it would need to show fieldgroups (and their hotkeys), and individual fields, and dedicated plot-groups, which may have different fields in them. Collectively, these might be called "ranged items or scaled items"? (because they can be any of those 3 things)
+3. X-axis labels (note our plot is scrolling vertically in the terminal) (Future plan to keep in consideration): We're likely going to need values of the ranges shown in the X axis (optional Top/Bottom/(Both but staggered or manually positioned, to reduce overlap (limited screen real-estate)).
+The user might toggle a range item's top or bottom location of its limits. For example, if I set a sine-wave plot, alone, to normalized, on the left side it would show -1 at the left of the bottom of the X axis, and 1 at the right of the bottom.
+
+...a 10*sin() plot would show a -10 and 10.
+
+-10                                          10
+
+     Or the user toggles the 10* one and the values
+     show to the right of Y instead
+
+-1                                            1
+
+
+4. When a range item is selected in range mod mode, some hotkeys should be usable for adjusting the assymmetric expansion and contraction speed.
+1. I should be able to pick a field to focus on and it'll "zoom in" to that plot, or the group,
+and it'll auto-set bounds which "expand-only" (by default).
+Or they set the expansion speed and contraction speed individually (ie. an assymetric moving avg for growing ranges or contracting, and 
+
+should also be able to toggle "freezing" the bounds
+
+i presume it's possible someone 'snapshots' a range into a preset (like vim letter-referenced registers) -- a quick way to just assign it and change where they're looking.
+when in frozen mode, it'll just pop back to that range when they choose a snapshot.
+when not in frozen mode, if any plots are currently set as the bounds targets the normal auto-moving bounds method would kick in.
+
+We might also do the user a favor and store a few logarithmic snapshots for when they're watching a plot and suddenly their data goes whacky and messes up their range, and they can say "no! go to 1s ago it was perfect!", so max human reaction time is (50ms maybe? 100ms, 250ms, 500ms, 1s 5s 10s 30s, 60s, 2m, 5m, 10m, 30m, 1h.  That's enough.. too much!
+
+I think they should be able to assign the current plot's range to a new lettered group, where the auto-ranging from before happens, but as they add plots to it, it incorporates those.  Hotkeys are already assigned to plots, so they can hit a key in the range-assignment mode, where it lists the plots, and whatever plot key they toggle is added/removed from the plot group. Each time they toggle one I think we should store the prior, and undo that, so they don't have to wait for a slow-moving range to drop back down when they remove it from the range..
+
+and if they go through all this effort to assign values or pick ranges, they should be storable. Maybe by default we store it in the current state file, but they can commit that to their fieldspec yaml tacking on {name}-ranges.yaml, so we don't mess with their original yaml. that's better -- unless they've chosen a ranges file with a cli option.
+
+Oh, they should be able to pick a bound (low/high) and type in a value.
+
+For any lettered range they should be able to hit a key to assign it a name.
+If they just make a new rangeset, it should automatically pick the next letter/number.
+
+What other important methods exist that we should definitely include. If I covered everything already...
+
