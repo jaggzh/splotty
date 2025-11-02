@@ -234,6 +234,16 @@ my $legend_update_counter = 0;
 # Open keyboard input source based on mode
 my $kb_input_fh;
 
+# ---------------- Normalization & Range Management ----------------
+my $normalize_mode = 0;  # 0=global range, 1=per-field normalized
+my %field_ranges;        # Current ranges per field: {field_name} => {min => $min, max => $max}
+my %range_smoothing = (
+    expand_rate => 1.0,    # Instant expansion (1.0 = immediate)
+    contract_rate => 0.01, # Slow contraction (0.05 = 5% per update)
+);
+
+my $cleaned = 0; # Clean-up flag for shutting down
+
 sub millis() {
     my ($s, $usec) = gettimeofday();
     my $ms = $s*1000 + int($usec/1000);
@@ -458,7 +468,7 @@ sub assign_auto_shortcuts {
     }
 
     # Collect excluded keys (UI keys + manual assignments)
-    my @exclude = ('q', 'N', 'Q');  # Reserved UI keys
+    my @exclude = ('q', 'N', 'Q', 'r');  # Reserved UI keys
     push @exclude, values %$manual_field_shortcuts;
     push @exclude, values %group_shortcuts;
 
@@ -950,9 +960,6 @@ sub replay_history {
     my $rows_to_replay = $history_depth < $plot_height ? $history_depth : $plot_height;
     my $start_idx = $history_depth - $rows_to_replay;
 
-    # Calculate range for the entire history we're replaying
-    my ($vmin, $vmax) = window_minmax();
-
     # Temporarily disable scrolling to place rows directly
     reset_scroll_region();
 
@@ -968,7 +975,9 @@ sub replay_history {
             $values[$i] = $hist[$i]->[$hist_idx] if $hist_idx < @{$hist[$i]};
         }
 
-        my $row = build_plot_row($vmin, $vmax);
+        # Calculate ranges for this historical point
+        my $ranges = calculate_ranges();
+        my $row = build_plot_row($ranges);
         print gotorc($screen_row, 1), $row, clr_eol();
     }
 
@@ -1563,7 +1572,8 @@ sub draw_footer {
             my $raw_status = $raw_output_active ? " ^D=close raw" : " ^D=raw panel";
             my $raw_resize = $raw_output_active ? " +/-=resize" : "";
             my $shortcuts_info = %fieldspec ? " [fld/grp keys active]" : "";
-            $label = " q=quit N=toggle numbers ^T=Term.input$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs ^W:Wr.Fields";
+            my $norm_status = $normalize_mode ? " [NORM]" : " [GLOB]";
+            $label = " q=quit N=toggle numbers r=range mode$norm_status ^T=Term.input$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs ^W:Wr.Fields";
         } elsif ($i == 1 && $debug_msg) {
             $label = $debug_msg;
         }
@@ -1620,7 +1630,7 @@ sub step_series_demo {
 
 # Build one row string containing all series glyphs at mapped columns
 sub build_plot_row {
-    my ($vmin, $vmax) = @_;
+    my $ranges = shift;  # Pass in pre-calculated ranges
     return "" if $S == 0;  # No data yet
 
     my $width = $plot_width;
@@ -1632,7 +1642,10 @@ sub build_plot_row {
         next if is_field_hidden($field_name);   # Skip hidden fields
         next unless is_field_enabled($field_name);  # Skip disabled fields
 
-        my $col = val_to_col($values[$i], $vmin, $vmax);
+        my $range = $ranges->{$field_name}; # This line
+        next unless $range;  # Safety check
+
+        my $col = val_to_col($values[$i], $range->{min}, $range->{max});
         my $config = get_field_config($field_name);
         my $glyph = $config->{ch} // $glyphs[$i % @glyphs];
 
@@ -1694,6 +1707,67 @@ sub window_minmax {
     # Ensure non-degenerate range
     if ($hi - $lo < 1e-6) { $hi += 1; $lo -= 1 }
     return ($lo,$hi);
+}
+
+sub calculate_ranges {
+    my %ranges;
+
+    if ($normalize_mode) {
+        # Per-field ranges
+        for my $i (0..$S-1) {
+            my $field_name = $field_names[$i] // ($i + 1);
+            next if is_field_hidden($field_name);
+            next unless is_field_enabled($field_name);
+
+            my ($lo, $hi) = (1e9, -1e9);
+            for my $v (@{$hist[$i]}) {
+                $lo = $v if $v < $lo;
+                $hi = $v if $v > $hi;
+            }
+            if ($hi - $lo < 1e-6) { $hi += 1; $lo -= 1; }
+            $ranges{$field_name} = {min => $lo, max => $hi};
+        }
+    } else {
+        # Global range (existing behavior)
+        my ($lo, $hi) = window_minmax();
+        for my $i (0..$S-1) {
+            my $field_name = $field_names[$i] // ($i + 1);
+            next if is_field_hidden($field_name);
+            next unless is_field_enabled($field_name);
+            $ranges{$field_name} = {min => $lo, max => $hi};
+        }
+    }
+
+    return \%ranges;
+}
+
+sub smooth_ranges {
+    my ($new_ranges) = @_;
+    my %smoothed;
+
+    for my $field_name (keys %$new_ranges) {
+        my $new = $new_ranges->{$field_name};
+        my $old = $field_ranges{$field_name};
+
+        if (!$old) {
+            # First time seeing this field, no smoothing needed
+            $smoothed{$field_name} = $new;
+            next;
+        }
+
+        # Expand instantly, contract slowly
+        my $min = $new->{min} < $old->{min} ?
+            $new->{min} :
+            $old->{min} + ($new->{min} - $old->{min}) * $range_smoothing{contract_rate};
+
+        my $max = $new->{max} > $old->{max} ?
+            $new->{max} :
+            $old->{max} + ($new->{max} - $old->{max}) * $range_smoothing{contract_rate};
+
+        $smoothed{$field_name} = {min => $min, max => $max};
+    }
+
+    return \%smoothed;
 }
 
 # ---------------- Main ----------------
@@ -1852,6 +1926,11 @@ while (1) {
                 write_fieldspec_template();
             } elsif ($ord_ch == 25) {  # ^Y (CTRL+y)
                 @colors = shuffle @colors;
+            } elsif ($key eq 'r') {  # Toggle normalization mode
+                $normalize_mode = !$normalize_mode;
+                my $mode_name = $normalize_mode ? "NORMALIZED" : "GLOBAL";
+                set_debug("Range mode: $mode_name");
+                draw_footer();  # Update footer to show new mode
             } elsif ($ord_ch == 20) {  # ^T (CTRL+t)
                 # Check if input mode is supported
                 if ($data_source_type ne 'serial') {
@@ -1953,9 +2032,12 @@ while (1) {
         }
 
         if ($any_enabled) {
-            my ($vmin,$vmax) = window_minmax();
+            my $ranges = calculate_ranges();
+            $ranges = smooth_ranges($ranges);
+            %field_ranges = %$ranges;  # Store for next smoothing cycle
+
             # Build one row and print it at bottom of scroll region
-            my $row = build_plot_row($vmin,$vmax);
+            my $row = build_plot_row($ranges);
             setup_plot_output_scroll();
             print gotorc($plot_bottom, 1), $row, clr_eol(), "\n";
         }

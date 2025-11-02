@@ -5,6 +5,7 @@ main:
 vi:
 	vim Makefile \
 		splotty \
+		lib/String/ShortcutsAuto.pm \
 		log.splotty.txt \
 
 # Leave blank line above
