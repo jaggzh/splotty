@@ -241,8 +241,7 @@ my %range_smoothing = (
     expand_rate => 1.0,    # Instant expansion (1.0 = immediate)
     contract_rate => 0.01, # Slow contraction (0.05 = 5% per update)
 );
-
-my $cleaned = 0; # Clean-up flag for shutting down
+my $state_was_loaded = 0;
 
 sub millis() {
     my ($s, $usec) = gettimeofday();
@@ -271,6 +270,8 @@ sub get_config_dir {
 sub load_state {
     return unless -f $state_file;
 
+    my $rc = 0;
+
     eval {
         my $state = LoadFile($state_file);
 
@@ -293,14 +294,34 @@ sub load_state {
             $opt{fieldspec} = $state->{last_state}->{fieldspec_path};
         }
 
-        # Load saved states if using same fieldspec
-        if ($state->{last_state} &&
-            $state->{last_state}->{fieldspec_path} eq abs_path($opt{fieldspec} // '')) {
+        # Normalize fieldspec paths for comparison
+        my $current_fieldspec = $opt{fieldspec} ? abs_path($opt{fieldspec}) : '';
+        my $saved_fieldspec = $state->{last_state}->{fieldspec_path} // '';
+
+        # Load saved states if using same fieldspec (or both using no fieldspec)
+        if ($state->{last_state} && $saved_fieldspec eq $current_fieldspec) {
             %group_states = %{$state->{last_state}->{groups} // {}};
             %field_states = %{$state->{last_state}->{fields} // {}};
+            
+            # Load saved shortcuts
+            if ($state->{last_state}->{field_shortcuts}) {
+                %field_shortcuts = %{$state->{last_state}->{field_shortcuts}};
+                # Build reverse mapping
+                %shortcut_to_field = reverse %field_shortcuts;
+            }
+            if ($state->{last_state}->{group_shortcuts}) {
+                %group_shortcuts = %{$state->{last_state}->{group_shortcuts}};
+                # Build reverse mapping
+                %shortcut_to_group = reverse %group_shortcuts;
+            }
+            
+            # Return true to indicate matching state
+            # (informs caller and load_fieldspec to abide by state)
+            $rc = 1;
         }
     };
     warn "Failed to load state: $@" if $@;
+    return $rc;  # No matching state loaded (inform caller)
 }
 
 sub save_state {
@@ -312,6 +333,8 @@ sub save_state {
             fieldspec_path => $fieldspec_path,
             groups => \%group_states,
             fields => \%field_states,
+            field_shortcuts => \%field_shortcuts,
+            group_shortcuts => \%group_shortcuts,
             serial_port => $opt{serial_port},
             baud_rate => $opt{baud_rate},
         }
@@ -354,9 +377,11 @@ sub load_fieldspec {
                 # Skip hidden fields - they don't get state or shortcuts
                 next if $field->{hidden};
 
-                # Field starts with global start state, then affected by groups
-                my $start_state = $fieldspec{state}->{start} // 1;
-                $field_states{$field_name} //= $start_state;
+                # Only initialize field states from fieldspec if we didn't load saved state
+                if (!$state_was_loaded) {
+                    my $start_state = $fieldspec{state}->{start} // 1;
+                    $field_states{$field_name} //= $start_state;
+                }
 
                 if (!exists $$field{key}) {
                     if ( ! exists $fieldspec{defaults}{fields}{key_auto}
@@ -370,7 +395,9 @@ sub load_fieldspec {
         }
 
         # Apply group states to fields in order
-        apply_group_states_to_fields();
+        # Only do this if we didn't load saved state (this is first run with fieldspec)
+        # Otherwise, respect the saved field states which may override groups
+        apply_group_states_to_fields() unless $state_was_loaded;
 
         # Auto-assign shortcuts for 'auto' fields and groups
         assign_auto_shortcuts(\%manual_field_shortcuts);
@@ -443,7 +470,10 @@ sub assign_auto_shortcuts {
             next if $field->{hidden};  # Skip hidden fields
 
             if (($field->{key} // '') eq 'auto') {
-                push @auto_fields, $field_name;
+                # Check if we already have a saved shortcut for this field
+                if (!exists $field_shortcuts{$field_name}) {
+                    push @auto_fields, $field_name;
+                }
             }
         }
     }
@@ -451,8 +481,9 @@ sub assign_auto_shortcuts {
     # Also include field_names that aren't in fieldspec at all (dynamic fields)
     for my $field_name (@field_names) {
         next if is_field_hidden($field_name);  # Skip hidden fields
-        # If field isn't in fieldspec, it needs auto-assignment
-        if (!exists $fieldspec{fields} || !exists $fieldspec{fields}->{$field_name}) {
+        # If field isn't in fieldspec and doesn't have a shortcut, it needs auto-assignment
+        if ((!exists $fieldspec{fields} || !exists $fieldspec{fields}->{$field_name}) &&
+            !exists $field_shortcuts{$field_name}) {
             push @auto_fields, $field_name unless grep { $_ eq $field_name } @auto_fields;
         }
     }
@@ -462,15 +493,19 @@ sub assign_auto_shortcuts {
         for my $group_name (keys %{$fieldspec{groups}}) {
             my $group = $fieldspec{groups}->{$group_name};
             if (($group->{key} // '') eq 'auto') {
-                push @auto_groups, $group_name;
+                # Check if we already have a saved shortcut for this group
+                if (!exists $group_shortcuts{$group_name}) {
+                    push @auto_groups, $group_name;
+                }
             }
         }
     }
 
-    # Collect excluded keys (UI keys + manual assignments)
+    # Collect excluded keys (UI keys + manual assignments + already-assigned shortcuts)
     my @exclude = ('q', 'N', 'Q', 'r');  # Reserved UI keys
     push @exclude, values %$manual_field_shortcuts;
     push @exclude, values %group_shortcuts;
+    push @exclude, values %field_shortcuts;  # Existing shortcuts from state
 
     # Assign shortcuts for auto fields
     if (@auto_fields) {
@@ -1800,7 +1835,7 @@ $SIG{TERM} = sub { cleanup(); restore_tty(); exit 143 };
 $SIG{__DIE__} = sub { cleanup(); restore_tty(); die @_ };
 
 # Load state and fieldspec
-load_state();
+$state_was_loaded = load_state();
 if ($opt{fieldspec}) {
     load_fieldspec($opt{fieldspec}) or die "Failed to load fieldspec: $opt{fieldspec}\n";
 }
