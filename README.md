@@ -9,6 +9,8 @@ $ cat data.txt | splotty --stdin --delay_ms=20  # Slow down, cat!
 $ splotty --stdin --delay_ms=20 < data.txt  # Same thing
 $ splotty -p /dev/ttyUSB0 -b 115200
 $ splotty           # Last-used settings were automatically-stored!
+$ alias s0='stdbuf -i0 -o0' # Useful to unbuffer for smoother pipes
+$ s0 myprog | s0 splotty --stdin
 ```
 
 **More in *Quick Start* section below**
