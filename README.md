@@ -5,6 +5,7 @@ Terminal-based real-time plotter for Arduino and embedded serial data. This seem
 ```bash
 $ splotty --demo              # quick demo
 $ myprog | splotty --stdin    # Pipe from programs
+$ cat data.txt | splotty --stdin --delay_ms=20  # Slow down, cat!
 $ splotty -p /dev/ttyUSB0 -b 115200
 $ splotty           # Last-used settings were automatically-stored!
 ```
