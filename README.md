@@ -1,6 +1,15 @@
-# splotty - Serial Text Plotter
+# splotty - Serial Text Plotter (now with --stdin support!)
 
 Terminal-based real-time plotter for Arduino and embedded serial data. This seems to be the start of the only proper general-purpose terminal-based plotter, and right now it already works and is usable (at least for many of my projects). It is the first version basically though.
+
+```bash
+$ splotty --demo              # quick demo
+$ myprog | splotty --stdin    # Pipe from programs
+$ splotty -p /dev/ttyUSB0 -b 115200
+$ splotty           # Last-used settings were automatically-stored!
+```
+
+**More in *Quick Start* section below**
 
 <div align="center">
   <em>Main plotting interface with field legend and controls</em><br>
