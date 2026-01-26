@@ -30,6 +30,9 @@ use File::Spec;
 
 binmode STDOUT, ':encoding(UTF-8)';
 
+my $def_serial_port = '/dev/ttyACM1'; # See kw SET_SERIAL below
+my $def_baud_rate = 115200; # See kw SET_BAUD_RATE below
+
 # ---------------- CLI ----------------
 my %opt = (
     header   => 2,     # minimum header lines; will be dynamic
@@ -38,8 +41,8 @@ my %opt = (
     window   => 30,    # autorange window (rows) across all series
     delay_ms => 0,     # inter-row delay in ms; default off (0)
     no_color => 0,     # disable color
-    serial_port => '/dev/ttyACM1',  # default serial port
-    baud_rate => 115200,            # default baud rate
+    serial_port => undef,    # serial device path/name
+    baud_rate => undef,             # baud rate
     demo_mode => 0,                 # use fake data instead of serial
     stdin_mode => 0,                # read data from stdin
     cmd => '',                      # command to execute and read from
@@ -66,7 +69,7 @@ OPTIONS:
     --window=N          Autorange window in rows (default: 30)
     --delay_ms=N         Inter-row delay in milliseconds (default: 0)
     --no-color            Disable color output
-    --serial-port|-p=PATH  Serial port path (default: /dev/ttyACM1)
+    --serial-port|-p=PATH  Serial port path (default: $def_serial_port)
                            (Stored for next run in ~/.config/splotty/state.yaml)
     --baud-rate|-r=N      Baud rate (default: 115200)
     --fieldspec=FILE     Load field specification YAML file
@@ -276,18 +279,14 @@ sub load_state {
         my $state = LoadFile($state_file);
 
         # Load last used serial settings if not specified on command line
-        if ($state->{last_state}) {
-            if (!defined $ARGV[0] || !grep { /--serial-port/ } @ARGV) {
-                if ($state->{last_state}->{serial_port}) {
-                    $opt{serial_port} = $state->{last_state}->{serial_port};
-                }
-            }
-            if (!grep { /--baud-rate/ } @ARGV) {
-                if ($state->{last_state}->{baud_rate}) {
-                    $opt{baud_rate} = $state->{last_state}->{baud_rate};
-                }
-            }
-        }
+        # Keyword SET_SERIAL
+        $opt{serial_port} = ($opt{serial_port} // 
+            $state->{last_state}->{serial_port}) //
+                $def_serial_port;
+        # Keyword SET_BAUD_RATE
+        $opt{baud_rate} = ($opt{baud_rate} // 
+            $state->{last_state}->{baud_rate}) //
+                $def_serial_port;
 
         # Load last used fieldspec if no fieldspec specified
         if (!$opt{fieldspec} && $state->{last_state} && $state->{last_state}->{fieldspec_path}) {
