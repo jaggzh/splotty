@@ -55,8 +55,16 @@ my %opt = (
 );
 my $logfile_debug = "log.splotty.txt";
 
+sub pager { # $p = pager(); print $p "stuff"; pagerdone($p);
+    my $pager;
+    open($pager, '|-', ($ENV{PAGER} // 'less -RF')) && return $pager;
+    \*STDOUT;
+}
+sub pagerdone($p) { close $p; }
+
 sub show_help {
-    print <<"EOF";
+    my $p = pager();
+    print $p <<"EOF";
 splotty: Serial-data Text-based Plotter
 
 USAGE:
@@ -110,6 +118,7 @@ EXAMPLES:
     cat data.txt | splotty --stdin          # Read from pipe
     splotty --cmd="./sensor-reader"         # Read from command
 EOF
+	pagerdone($p);
     exit 0;
 }
 
@@ -271,7 +280,12 @@ sub get_config_dir {
 }
 
 sub load_state {
-    return unless -f $state_file;
+    # A couple values we have to see if cli overrides defaults AND state.
+    # They're undefined so we have to set them if not specified.
+    if (! -f $state_file) {
+        $opt{serial_port} = $def_serial_port if !defined $opt{serial_port};
+        $opt{baud_rate} = $def_baud_rate if !defined $opt{baud_rate};
+    }
 
     my $rc = 0;
 
@@ -280,13 +294,13 @@ sub load_state {
 
         # Load last used serial settings if not specified on command line
         # Keyword SET_SERIAL
-        $opt{serial_port} = ($opt{serial_port} // 
-            $state->{last_state}->{serial_port}) //
-                $def_serial_port;
+        if (!defined $opt{serial_port} && exists $state->{last_state}) {
+            $opt{serial_port} = $state->{last_state}->{serial_port} // $def_serial_port;
+        }
         # Keyword SET_BAUD_RATE
-        $opt{baud_rate} = ($opt{baud_rate} // 
-            $state->{last_state}->{baud_rate}) //
-                $def_serial_port;
+        if (!defined $opt{baud_rate} && exists $state->{last_state}) {
+            $opt{baud_rate} = $state->{last_state}->{baud_rate} // $def_baud_rate;
+        }
 
         # Load last used fieldspec if no fieldspec specified
         if (!$opt{fieldspec} && $state->{last_state} && $state->{last_state}->{fieldspec_path}) {
