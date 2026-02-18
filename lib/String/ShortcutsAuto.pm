@@ -51,12 +51,15 @@ sub assign_shortcuts {
     }
     
     # Warn about conflicts
+    open(my $conflictf, ">", "/tmp/splotty-conflicts.txt") || die "Can't create conflicts file: $!";
     if (@conflicts) {
         for my $conflict (@conflicts) {
             warn "$conflict\n";
+            say $conflictf "$conflict\n";
         }
         sleep $conflict_delay if $conflict_delay > 0;
     }
+    close $conflictf;
     
     # Get list of strings that need auto-assignment
     my @auto_strings = grep { !exists $result{$_} } @$strings;

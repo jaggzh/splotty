@@ -361,7 +361,7 @@ sub save_state {
 
 sub load_fieldspec {
     my ($file) = @_;
-    return unless $file && -f $file;
+    return if !defined $file || !-f $file;
 
     eval {
         %fieldspec = %{LoadFile($file)};
@@ -428,14 +428,17 @@ sub load_fieldspec {
         if ($opt{force} || $opt{wipe}) {
             swarn($err);
         }
+        say STDERR "wipe:" . ($opt{wipe}) . " force:" . ($opt{force}); # debug message I have in for now because it wouldn't die on errors in assign_auto_shortcut
         if ($opt{wipe}) {
             $fieldspec_path = '';
             save_state();
             swarn("Wiped.");
-            exit 0;
+            die "Wiped fieldspec. Run again."; # debug dying I have in for now because it wouldn't die on errors in assign_auto_shortcut
+            # exit 0;
         } elsif (!$opt{force}) {
             swarn($err);
-            exit 1;
+            die "Error loading fieldspec. Use --force if you want."; # debug dying I have in for now because it wouldn't die on errors in assign_auto_shortcut
+            # exit 1;
         }
         return;
     }
