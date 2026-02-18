@@ -15,7 +15,7 @@ use Getopt::Long;
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use FindBin;
 use lib "$FindBin::RealBin/lib";
-use String::ShortcutsAuto qw(assign_shortcuts);
+use String::ShortcutsAuto qw(assign_shortcuts find_shortcut_conflicts);
 use YAML::XS qw(LoadFile DumpFile Dump);
 use File::Slurper qw(write_text);
 use File::HomeDir;
@@ -411,6 +411,18 @@ sub load_fieldspec {
         # Only do this if we didn't load saved state (this is first run with fieldspec)
         # Otherwise, respect the saved field states which may override groups
         apply_group_states_to_fields() unless $state_was_loaded;
+
+        my @ui_keys = ('q', 'N', 'Q', 'r');
+        my @sc_conflicts = find_shortcut_conflicts(
+            ui               => \@ui_keys,
+            fieldspec_groups => [values %group_shortcuts],
+            fieldspec_fields => [values %manual_field_shortcuts],
+        );
+        if (@sc_conflicts) {
+            my $msg = "Conflicting shortcuts (may come from state OR fieldspec file):\n";
+            $msg .= "  $_\n" for @sc_conflicts;
+            die $msg;
+        }
 
         # Auto-assign shortcuts for 'auto' fields and groups
         assign_auto_shortcuts(\%manual_field_shortcuts);

@@ -6,7 +6,7 @@ use Exporter 'import';
 # use bansi; #debug
 # sub pdd($v) { print Dumper($v) } #debug
 
-our @EXPORT_OK = qw(assign_shortcuts);
+our @EXPORT_OK = qw(assign_shortcuts find_shortcut_conflicts);
 our $VERSION = '1.0';
 
 # Default conflict delay in seconds
@@ -93,6 +93,33 @@ sub assign_shortcuts {
 	# say "Count: " . scalar(keys %result);
 	# die;
     return %result;
+}
+
+sub find_shortcut_conflicts {
+    my %groups = @_;
+    my %key_sources;  # key => [group names, with repeats for duplicates]
+
+    for my $gname (sort keys %groups) {
+        for my $key (@{$groups{$gname}}) {
+            next if !defined $key || $key eq '' || $key eq 'auto';
+            push @{$key_sources{$key}}, $gname;
+        }
+    }
+
+    my @conflicts;
+    for my $key (sort keys %key_sources) {
+        my @sources = @{$key_sources{$key}};
+        next if @sources < 2;
+        # Annotate any group that appears more than once as a duplicate
+        my %gname_count;
+        $gname_count{$_}++ for @sources;
+        my @source_labels = do {
+            my %seen;
+            map { $seen{$_}++ ? () : ($gname_count{$_} > 1 ? "$_(duplicate)" : $_) } @sources;
+        };
+        push @conflicts, "Key '$key' found in: " . join(', ', @source_labels);
+    }
+    return @conflicts;
 }
 
 sub _calculate_commonality {
