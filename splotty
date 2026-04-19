@@ -102,6 +102,7 @@ CONTROLS (in plotter):
     ^T                  Toggle terminal input mode (send data to serial
                           - serial mode only)
     ^D                  Toggle raw serial output window
+    ^G                  Save currently enabled visible fields as a group
     +/-                 Resize raw output window (when active)
     [field keys]        Toggle individual fields (defined in fieldspec)
     [group keys]        Toggle field groups (defined in fieldspec)
@@ -181,6 +182,8 @@ my $inline_nums_on = 0;  # toggle with 'N' to show/hide per-glyph sensor numbers
 my $min_plot_height = 6;
 my $debug_msg = "";      # debug message for footer
 my $input_active = 0;    # whether terminal input line is active
+my $input_mode = '';     # active prompt mode ('send', 'save_group')
+my $input_prompt = '';   # prompt prefix for active input mode
 my $input_buffer = "";   # current input buffer
 my $input_cursor = 0;    # cursor position in input buffer
 
@@ -875,6 +878,135 @@ sub write_fieldspec_template {
 # ---------------- Serial Data ----------------
 my $serial_buffer = '';
 
+
+sub activate_input_mode {
+    my ($mode, $prompt) = @_;
+    $input_active = 1;
+    $input_mode = $mode;
+    $input_prompt = $prompt;
+    $input_buffer = "";
+    $input_cursor = 0;
+    recompute_layout();
+    draw_header();
+}
+
+sub deactivate_input_mode {
+    $input_active = 0;
+    $input_mode = '';
+    $input_prompt = '';
+    $input_buffer = "";
+    $input_cursor = 0;
+    recompute_layout();
+    draw_header();
+}
+
+sub get_enabled_field_names {
+    my @enabled_fields = ();
+
+    for my $field_name (@field_names) {
+        next if is_field_hidden($field_name);
+        next unless $field_states{$field_name};
+        push @enabled_fields, $field_name;
+    }
+
+    return @enabled_fields;
+}
+
+sub make_temp_fieldspec_path {
+    my $tmpdir = File::Spec->tmpdir();
+    my $timestamp = strftime("%Y%m%d-%H%M%S", localtime);
+    return File::Spec->catfile($tmpdir, "splotty-fields-savegroup-$timestamp-$$.yaml");
+}
+
+sub save_current_enabled_fields_as_group {
+    my ($group_name) = @_;
+    $group_name =~ s/^\s+//;
+    $group_name =~ s/\s+$//;
+
+    if (!length $group_name) {
+        set_debug("Group save aborted");
+        return 0;
+    }
+
+    my @enabled_fields = get_enabled_field_names();
+    if (!@enabled_fields) {
+        set_debug("No enabled visible fields to save");
+        return 0;
+    }
+
+    my $target_file = $fieldspec_path || make_temp_fieldspec_path();
+    my %spec = ();
+
+    if (-f $target_file) {
+        eval {
+            %spec = %{LoadFile($target_file)};
+            1;
+        } or do {
+            my $err = $@ || 'unknown load error';
+            set_debug("Could not load fieldspec '$target_file': $err");
+            return 0;
+        };
+    }
+
+    $spec{defaults} //= { fields => { key_auto => 1 } };
+    $spec{defaults}{fields} //= {};
+    $spec{defaults}{fields}{key_auto} = 1
+        if !exists $spec{defaults}{fields}{key_auto};
+
+    $spec{state} //= {};
+    $spec{state}{start} = 1 if !exists $spec{state}{start};
+
+    $spec{groups} //= {};
+    $spec{fields} //= {};
+
+    if (exists $spec{groups}{$group_name}) {
+        set_debug("Group '$group_name' exists in '$target_file'. Choose a unique name.");
+        return 0;
+    }
+
+    $spec{groups}{$group_name} = {
+        key => 'auto',
+        state => 1,
+    };
+
+    for my $field_name (@enabled_fields) {
+        $spec{fields}{$field_name} //= {};
+        my $field = $spec{fields}{$field_name};
+        $field->{groups} //= [];
+        push @{$field->{groups}}, $group_name
+            unless grep { $_ eq $group_name } @{$field->{groups}};
+    }
+
+    eval {
+        DumpFile($target_file, \%spec);
+        1;
+    } or do {
+        my $err = $@ || 'unknown write error';
+        set_debug("Failed to write fieldspec '$target_file': $err");
+        return 0;
+    };
+
+    my $created_temp_file = !$fieldspec_path;
+    $opt{fieldspec} = $target_file;
+    $fieldspec_path = abs_path($target_file) // $target_file;
+
+    %fieldspec = ();
+    %shortcut_to_field = ();
+    %shortcut_to_group = ();
+
+    load_fieldspec($target_file);
+
+    if ($created_temp_file) {
+        set_debug("No fieldspec specified. Entries written to $target_file");
+    } else {
+        set_debug("Saved group '$group_name' to '$target_file'");
+    }
+
+    save_state();
+    set_need_redraw("Saved group '$group_name'");
+    return 1;
+}
+
 sub open_data_source {
     # Determine data source type
     if ($opt{demo_mode}) {
@@ -1197,7 +1329,7 @@ sub draw_header {
     # Row 2: Input line (when active) or empty
     print gotorc(2,1), $barbg, fg256(231);
     if ($input_active) {
-        my $prompt = " Send> ";
+        my $prompt = $input_prompt || " Input> ";
         my $available_width = $COLS - 1 - length($prompt);
         my $display_buffer = $input_buffer;
         my $display_cursor = $input_cursor;
@@ -1636,7 +1768,7 @@ sub draw_footer {
             my $raw_resize = $raw_output_active ? " +/-=resize" : "";
             my $shortcuts_info = %fieldspec ? " [fld/grp keys active]" : "";
             my $norm_status = $normalize_mode ? " [NORM]" : " [GLOB]";
-            $label = " q=quit N=toggle numbers r=range mode$norm_status ^T=Term.input$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs ^W:Wr.Fields";
+            $label = " q=quit N=toggle numbers r=range mode$norm_status ^T=Term.input ^G=SaveGrp$raw_status$raw_resize$shortcuts_info Flds:$S ^Y:Clrs ^W:Wr.Fields";
         } elsif ($i == 1 && $debug_msg) {
             $label = $debug_msg;
         }
@@ -1935,48 +2067,47 @@ while (1) {
     if (defined $key && length $key) {
         my $ord_ch = -1;
         $ord_ch = ord($key) if length $key == 1; # Only get ascii value if is single char
-        if ($input_active) { # Handle serial Send input mode
-            # ^T and a blank enter will end input mode (unless that's disabled)
-            if ($ord_ch == 20) {  # ^t (CTRL+t)
-                $input_active = 0;
-                draw_header();
-            } elsif ($ord_ch == 20) {  # ^T (CTRL+t) # Terminal/serial line input
-                # Check if input mode is supported
-                if ($data_source_type ne 'serial') {
-                    set_debug("Terminal input (^T) only available in serial mode");
-                } else {
-                    $input_active = 0;
-                    draw_header();
-                }
-            } elsif (length($input_buffer)<1 && !$opt{no_enter_ends_input} &&
-                    ($key eq "\n" || $key eq "\r")) {
-                $input_active = 0;
-                draw_header();
-            } elsif ($key eq "\n" || $key eq "\r") {  # Enter with something in buffer
-                # Send the input (WITH the trailing enter)
-                if (length($input_buffer) > 0) {
-                    send_serial_data("$input_buffer$key");
-                    $input_buffer = "";
-                    $input_cursor = 0;
-                    draw_header();  # Update display but stay in input mode
-                }
-                # Stay in input mode - don't set $input_active = 0
+        if ($input_active) { # Handle active header input mode
+            if ($ord_ch == 20) {  # ^T always exits input mode
+                deactivate_input_mode();
+            } elsif ($ord_ch == 27) {  # Escape - cancel input
+                deactivate_input_mode();
+                $need_redraw = 1;
             } elsif ($ord_ch == 127 || $ord_ch == 8) {  # Backspace/Delete
                 if ($input_cursor > 0) {
                     substr($input_buffer, $input_cursor - 1, 1) = '';
                     $input_cursor--;
-                    draw_header();  # Immediate update
+                    draw_header();
                 }
-            } elsif ($ord_ch == 27) {  # Escape - cancel input
-                $input_buffer = "";
-                $input_cursor = 0;
-                $input_active = 0;
-                draw_header();  # Immediate update
-                $need_redraw = 1;
+            } elsif ($key eq "\n" || $key eq "\r") {
+                if ($input_mode eq 'send') {
+                    if (length($input_buffer) < 1 && !$opt{no_enter_ends_input}) {
+                        deactivate_input_mode();
+                    } elsif (length($input_buffer) > 0) {
+                        send_serial_data("$input_buffer$key");
+                        $input_buffer = "";
+                        $input_cursor = 0;
+                        draw_header();
+                    }
+                } elsif ($input_mode eq 'save_group') {
+                    if (length($input_buffer) < 1) {
+                        deactivate_input_mode();
+                        set_debug("Group save aborted");
+                    } else {
+                        my $save_ok = save_current_enabled_fields_as_group($input_buffer);
+                        if ($save_ok) {
+                            deactivate_input_mode();
+                        } else {
+                            draw_header();
+                        }
+                    }
+                } else {
+                    deactivate_input_mode();
+                }
             } elsif ($ord_ch >= 32 && $ord_ch <= 126) {  # Printable characters
                 substr($input_buffer, $input_cursor, 0) = $key;
                 $input_cursor++;
-                draw_header();  # Immediate update
+                draw_header();
             }
             # Arrow keys and other special handling could go here
         } else {
@@ -1999,11 +2130,14 @@ while (1) {
                 if ($data_source_type ne 'serial') {
                     set_debug("Terminal input (^T) only available in serial mode");
                 } else {
-                    $input_active = 1;
-                    $input_buffer = "";
-                    $input_cursor = 0;
-                    recompute_layout();  # Recalculate layout with input
-                    draw_header();
+                    activate_input_mode('send', " Send> ");
+                }
+            } elsif ($ord_ch == 7) {  # ^G (CTRL+g)
+                my @enabled_fields = get_enabled_field_names();
+                if (!@enabled_fields) {
+                    set_debug("No enabled visible fields to save");
+                } else {
+                    activate_input_mode('save_group', " New Group Name (clear and enter to abort): ");
                 }
                 # $need_redraw = 1;
             } elsif ($ord_ch == 4) {  # ^D (Ctrl+D)
