@@ -2,6 +2,43 @@
 
 Terminal-based real-time plotter for Arduino and embedded serial data. This seems to be the start of the only proper general-purpose terminal-based plotter, and right now it already works and is usable (at least for many of my projects). It is the first version basically though.
 
+## Update: 2026-04-18: 
+
+ - I merged in a new feature on the 23rd. Live creation of a new group (CTRL+G).auto-adding of fields to 
+ - Just toggle on the fields you want in the new group. Hit ^G, and type in the name of your new group.
+
+Now, this came with some issues -- I had to modify my fieldspec.yaml (I often call it splotty.yaml).
+People had to hand-write their fields and groups. Most YAML modules damage the order. The Perl YAML::XS
+is one of the only ones that put in the effort to preserve order and style (like [lists] vs. - itema\n -item b.)
+But comments aren't handled.
+
+Anyway, I decided to write out your new groups and fields to yourfieldspec*-supp*.yaml
+If you eventually like it, use -f fieldspec.yaml --compress and it'll parse the thing, retaining
+comments and order, etc. But it's beta, so it makes a backup. Good luck. (The one special one of you
+that uses this thing).
+
+## Why get started with my own fields.yaml?
+
+Adding "groups of fields" (with names), lets you toggle whole sets of your
+favorite/related fields with one keypress. For instance, for a gyroscope-accelerometer-magnetometer
+head-pointer mouse, *I have sensor values for Yaw (for moving left-right); and the filtered versions of it;
+and the final X movement of the mouse cursor, speed, etc.* I have a group **X**; splotty auto-assigns
+the hotkey **'X'** to it, or maybe I put *Key: X* in that group. Anyway, I have *All* fields in an *All* group;
+so I hit **'A'** to toggle everything off, then **'X'** to focus on my Yaw/X-axis work.
+
+## How do I get started with my own fields?
+
+1. Run splotty on your serial output, but we can also take piped | splotty.
+2. Ideally you'd have your output in Arduino-style **tab-separated** fields,
+with *fieldname:value\t*, so your fields will be named automatically. Hit *^W*
+and splotty will write out your fields for you to your **temp-dir** and will
+inform you about it.
+3. Copy that file to your project.
+4. You can use the file with `splotty -f myfields.yaml [other options]`
+5. Edit the file (it's fully-commented), or use the new *CTRL-g* in splotty to add visible fields to a new group.
+
+## Example command-lines:
+
 ```bash
 $ splotty --demo              # quick demo
 $ myprog | splotty --stdin    # Pipe from programs
