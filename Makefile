@@ -5,6 +5,7 @@ main:
 vi:
 	vim Makefile \
 		splotty \
+		lib/Splotty/FieldspecManager.pm \
 		lib/String/ShortcutsAuto.pm \
 		log.splotty.txt \
 

@@ -16,6 +16,12 @@ use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use FindBin;
 use lib "$FindBin::RealBin/lib";
 use String::ShortcutsAuto qw(assign_shortcuts find_shortcut_conflicts);
+use Splotty::FieldspecManager qw(
+    fieldspec_supp_path
+    load_fieldspec_merged
+    save_group_to_supp
+    compress_supp_into_main
+);
 use YAML::XS qw(LoadFile DumpFile Dump);
 use File::Slurper qw(write_text);
 use File::HomeDir;
@@ -52,6 +58,7 @@ my %opt = (
     version   => 0,                 # show version
     help => 0,                      # show help
     no_enter_ends_input => 0,       # Default is a blank enter exits Send mode
+    fs_compress => 0,               # merge foo-supp.yaml into foo.yaml and exit
 );
 my $logfile_debug = "log.splotty.txt";
 
@@ -84,6 +91,9 @@ OPTIONS:
     -f FILE             Short form of --fieldspec
     --wipe              Wipe stored fieldspec path
     --force             Force run, ignoring a bad fieldspec path
+    --fs-compress       Merge FIELDSPEC-supp.yaml into FIELDSPEC.yaml
+                        (preserves order & flow style), back up original,
+                        delete supp, then exit. Needs -f or saved path.
     --help              Show this help
     --version           Show version and quit
     --log               Log debug info to $logfile_debug
@@ -142,6 +152,7 @@ GetOptions(
     'version'       => \$opt{version},
     'log'           => \$opt{log},
     'no-enter-ends-input' => \$opt{no_enter_ends_input},
+    'fs-compress'         => \$opt{fs_compress},
 ) or die "Bad options. Use --help for usage information.\n";
 
 show_help() if $opt{help};
@@ -258,6 +269,23 @@ my %range_smoothing = (
 );
 my $state_was_loaded = 0;
 
+# --fs-compress: merge supp into main and exit (no terminal UI started)
+if ($opt{fs_compress}//0) {
+    if ( ! ($opt{fieldspec}//0) ) {
+        # fall back to saved state if -f wasn't given
+        eval {
+            my $st = LoadFile($state_file);
+            $opt{fieldspec} = $st->{last_state}{fieldspec_path} if $st;
+        };
+    }
+    die "--fs-compress requires a fieldspec file (-f or a previously-saved path).\n"
+        if ! ($opt{fieldspec}//0) || ! -f $opt{fieldspec};
+
+    my ($ok, $msg) = compress_supp_into_main($opt{fieldspec});
+    say $ok ? $msg : "Error: $msg";
+    exit($ok ? 0 : 1);
+}
+
 sub millis() {
     my ($s, $usec) = gettimeofday();
     my $ms = $s*1000 + int($usec/1000);
@@ -367,7 +395,7 @@ sub load_fieldspec {
     return if !defined $file || !-f $file;
 
     eval {
-        %fieldspec = %{LoadFile($file)};
+        %fieldspec = %{load_fieldspec_merged($file)};   # merges -supp.yaml if present
         $fieldspec_path = abs_path($file);
 
         # Initialize group states from fieldspec
@@ -934,73 +962,59 @@ sub save_current_enabled_fields_as_group {
         return 0;
     }
 
-    my $target_file = $fieldspec_path || make_temp_fieldspec_path();
-    my %spec = ();
+    if ($fieldspec_path) {
+        # ── Case A: main fieldspec is loaded ──
+        # Write only to the supp file; the user's main file is never touched.
 
-    if (-f $target_file) {
-        eval {
-            %spec = %{LoadFile($target_file)};
-            1;
-        } or do {
-            my $err = $@ || 'unknown load error';
-            set_debug("Could not load fieldspec '$target_file': $err");
+        if (exists $fieldspec{groups}{$group_name}) {
+            set_debug("Group '$group_name' already exists. Choose a unique name.");
             return 0;
+        }
+
+        my $supp_path = eval {
+            save_group_to_supp($fieldspec_path, $group_name, \@enabled_fields);
         };
+        if ($@) {
+            (my $err = $@) =~ s/ at .+//s;
+            set_debug("Failed to save group: $err");
+            return 0;
+        }
+
+        my $supp_base = (File::Spec->splitpath($supp_path))[2];
+        set_debug("Saved group '$group_name' to: $supp_base");
+
+    } else {
+        # ── Case B: no fieldspec loaded ──
+        # Create a minimal temp main file; future saves go to its sibling supp.
+
+        my $target_file = make_temp_fieldspec_path();
+        my %spec = (
+            defaults => { fields => { key_auto => 1 } },
+            state    => { start  => 1 },
+            groups   => { $group_name => { key => 'auto', state => 1 } },
+            fields   => {},
+        );
+        for my $field_name (@enabled_fields) {
+            $spec{fields}{$field_name} = { groups => [$group_name] };
+        }
+
+        eval { DumpFile($target_file, \%spec); 1 }
+            or do {
+                (my $err = $@ // 'unknown error') =~ s/ at .+//s;
+                set_debug("Failed to write temp fieldspec: $err");
+                return 0;
+            };
+
+        $opt{fieldspec} = $target_file;
+        $fieldspec_path = abs_path($target_file) // $target_file;
+        set_debug("No fieldspec loaded — created: $target_file");
     }
 
-    $spec{defaults} //= { fields => { key_auto => 1 } };
-    $spec{defaults}{fields} //= {};
-    $spec{defaults}{fields}{key_auto} = 1
-        if !exists $spec{defaults}{fields}{key_auto};
-
-    $spec{state} //= {};
-    $spec{state}{start} = 1 if !exists $spec{state}{start};
-
-    $spec{groups} //= {};
-    $spec{fields} //= {};
-
-    if (exists $spec{groups}{$group_name}) {
-        set_debug("Group '$group_name' exists in '$target_file'. Choose a unique name.");
-        return 0;
-    }
-
-    $spec{groups}{$group_name} = {
-        key => 'auto',
-        state => 1,
-    };
-
-    for my $field_name (@enabled_fields) {
-        $spec{fields}{$field_name} //= {};
-        my $field = $spec{fields}{$field_name};
-        $field->{groups} //= [];
-        push @{$field->{groups}}, $group_name
-            unless grep { $_ eq $group_name } @{$field->{groups}};
-    }
-
-    eval {
-        DumpFile($target_file, \%spec);
-        1;
-    } or do {
-        my $err = $@ || 'unknown write error';
-        set_debug("Failed to write fieldspec '$target_file': $err");
-        return 0;
-    };
-
-    my $created_temp_file = !$fieldspec_path;
-    $opt{fieldspec} = $target_file;
-    $fieldspec_path = abs_path($target_file) // $target_file;
-
-    %fieldspec = ();
+    # Reload the merged fieldspec into runtime (picks up -supp automatically)
+    %fieldspec         = ();
     %shortcut_to_field = ();
     %shortcut_to_group = ();
-
-    load_fieldspec($target_file);
-
-    if ($created_temp_file) {
-        set_debug("No fieldspec specified. Entries written to $target_file");
-    } else {
-        set_debug("Saved group '$group_name' to '$target_file'");
-    }
+    load_fieldspec($fieldspec_path);
 
     save_state();
     set_need_redraw("Saved group '$group_name'");
