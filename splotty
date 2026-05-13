@@ -229,11 +229,20 @@ my @colors = (
     196,208,220,40,45,51,201,190,33,129,99,178,75,141,214,160,
     124,197,198,202,203,209,210,211,
     46,47,48,76,82,83,118,154,156,191,192,
-    12,19,20,21,26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
+    12,
+    #19,20,21,
+    26,27,32,38,39,68,69,74,104,105,110,140,146,147,176,177,182,183,212,213,218,219,
     11,184,221,222,226,227,228,
     135,165,171,177,207,213,219,225,
     14,50,86,87,122,158,195,97
 );
+# srand(125);
+@colors = shuffle @colors;
+sub preview_colors() {
+    for my $ci (@colors) { printf '%s%d ', bg256($ci), $ci; }
+    say '';
+}
+# preview_colors(); exit;
 
 # ---------------- Data ----------------
 my $S = $opt{series};
@@ -265,7 +274,7 @@ my $normalize_mode = 0;  # 0=global range, 1=per-field normalized
 my %field_ranges;        # Current ranges per field: {field_name} => {min => $min, max => $max}
 my %range_smoothing = (
     expand_rate => 1.0,    # Instant expansion (1.0 = immediate)
-    contract_rate => 0.01, # Slow contraction (0.05 = 5% per update)
+    contract_rate => 0.001, # Slow contraction (0.05 = 5% per update)
 );
 my $state_was_loaded = 0;
 
